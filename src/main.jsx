@@ -114,12 +114,13 @@ async function burnVaultWatermark(inputFile) {
       if (!video.ended && !video.paused) animationFrame = requestAnimationFrame(drawFrame);
     };
     recorder.start(1000);
-    drawFrame();
-    await video.play();
-    await new Promise((resolve, reject) => {
+    const playbackEnded = new Promise((resolve, reject) => {
       video.onended = resolve;
       video.onerror = () => reject(new Error('Il video si è interrotto durante la creazione della copia.'));
     });
+    await video.play();
+    drawFrame();
+    await playbackEnded;
     if (recorder.state !== 'inactive') recorder.stop();
     await recorded;
     const actualType = recorder.mimeType || mimeType || 'video/webm';
