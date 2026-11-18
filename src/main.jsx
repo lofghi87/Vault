@@ -40,7 +40,7 @@ async function decryptVideo(blob, key, mime) {
   return new Blob([plain], { type: mime || 'video/mp4' });
 }
 
-async function burnVaultWatermark(inputFile) {
+async function burnVaultWatermark(inputFile, onProgress = () => {}) {
   if (typeof MediaRecorder === 'undefined' || !HTMLCanvasElement.prototype.captureStream || typeof AudioContext === 'undefined') {
     throw new Error('Questo browser non supporta la creazione della filigrana incorporata. Prova con una versione aggiornata di Safari o Chrome.');
   }
@@ -90,6 +90,7 @@ async function burnVaultWatermark(inputFile) {
     const drawFrame = () => {
       if (video.readyState >= 2) {
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
+        onProgress({ percent: video.duration ? Math.min(99, Math.round((video.currentTime / video.duration) * 100)) : 0, currentTime: video.currentTime, duration: video.duration });
         ctx.save();
         ctx.translate(canvas.width / 2, canvas.height / 2);
         ctx.rotate(-Math.PI / 7);
@@ -259,6 +260,7 @@ function App() {
   const [renameBusy, setRenameBusy] = useState(false);
   const [openingVideoId, setOpeningVideoId] = useState(null);
   const [shareBusy, setShareBusy] = useState(false);
+  const [shareProgress, setShareProgress] = useState('');
   const [copyFile, setCopyFile] = useState(null);
   const [incomingShare] = useState(() => parseIncomingShare());
   const [incomingShareLoading, setIncomingShareLoading] = useState(false);
@@ -651,11 +653,13 @@ function App() {
     setCopied(false);
     setCopyFile(null);
     setShareBusy(false);
+    setShareProgress('');
   }
 
   async function createTemporaryLink() {
     if (!shareItem || !session?.user?.id) return;
     setShareBusy(true);
+    setShareProgress('Download del video originale…');
     setError('');
     let sharePath = '';
     let shareRecordId = '';
@@ -663,8 +667,13 @@ function App() {
       if (shareItem.encrypted && !vaultKey) throw new Error('Sblocca nuovamente Vault per creare il link.');
       const { data: sourceBlob, error: downloadError } = await supabase.storage.from(BUCKET).download(shareItem.path);
       if (downloadError || !sourceBlob) throw new Error('Non riesco a scaricare il video originale: ' + (downloadError?.message || 'file non disponibile'));
+      setShareProgress('Preparazione del video…');
       const original = shareItem.encrypted ? await decryptVideo(sourceBlob, vaultKey, shareItem.mime) : sourceBlob;
-      const watermarked = await burnVaultWatermark(new File([original], shareItem.displayName || 'video', { type: shareItem.mime || original.type || 'video/mp4' }));
+      setShareProgress('Applicazione filigrana: 0%');
+      const watermarked = await burnVaultWatermark(new File([original], shareItem.displayName || 'video', { type: shareItem.mime || original.type || 'video/mp4' }), progress => {
+        setShareProgress('Applicazione filigrana: ' + progress.percent + '%');
+      });
+      setShareProgress('Cifratura della copia…');
       const outputMime = watermarked.type || 'video/webm';
       const outputExtension = outputMime.includes('mp4') ? '.mp4' : '.webm';
       const shareKey = await crypto.subtle.generateKey({ name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
@@ -673,6 +682,7 @@ function App() {
       const shareId = crypto.randomUUID();
       const safeName = (shareItem.displayName || getDisplayName(shareItem.name)).normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-90) || 'video';
       sharePath = session.user.id + '/_shares/' + shareId + '/' + safeName + outputExtension + '.vlt';
+      setShareProgress('Caricamento della copia temporanea…');
       const { error: uploadError } = await supabase.storage.from(BUCKET).upload(sharePath, encryptedShare, {
         cacheControl: '0', contentType: 'application/octet-stream', upsert: false
       });
@@ -694,12 +704,14 @@ function App() {
       };
       const url = window.location.origin + window.location.pathname + '#share=' + encodeURIComponent(JSON.stringify(payload));
       setShareUrl(url);
+      setShareProgress('Link creato.');
       await logActivity(session.user.id, 'share_created', shareItem.displayName || getDisplayName(shareItem.name), 'Creato link temporaneo con filigrana incorporata e copia cifrata separata');
       await loadSecurityData();
     } catch (e) {
       if (shareRecordId) await supabase.from('vault_shares').delete().eq('id', shareRecordId).eq('user_id', session.user.id);
       if (sharePath) await supabase.storage.from(BUCKET).remove([sharePath]);
       setError('Non sono riuscito a creare il link: ' + (e.message || 'errore sconosciuto'));
+      setShareProgress('');
     } finally {
       setShareBusy(false);
     }
@@ -1036,7 +1048,7 @@ function App() {
       {settingsOpen && <div className="modal-backdrop" onClick={() => !rotationBusy && setSettingsOpen(false)}><div className="share-modal settings-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={rotationBusy} onClick={() => setSettingsOpen(false)}><X size={18}/></button><div className="modal-icon"><KeyRound size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI SICUREZZA</div><h2>Modifica frase segreta</h2><p>Vault ricifrerà tutti i video con la nuova frase. Le frasi vengono elaborate solo sul dispositivo e non vengono inviate ai server.</p><form onSubmit={changeVaultPassphrase}><label>Nuova frase segreta</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphrase ? 'text' : 'password'} value={newVaultPassphrase} onChange={e => setNewVaultPassphrase(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Almeno 12 caratteri"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphrase(v => !v)} aria-label="Mostra nuova frase">{showNewVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><label>Conferma nuova frase</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphraseConfirm ? 'text' : 'password'} value={newVaultPassphraseConfirm} onChange={e => setNewVaultPassphraseConfirm(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Ripeti la nuova frase"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphraseConfirm(v => !v)} aria-label="Mostra conferma nuova frase">{showNewVaultPassphraseConfirm ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><p className="card-sub settings-warning">Non chiudere la pagina durante la procedura. Gli originali vengono eliminati solo dopo la verifica di tutte le nuove copie.</p><button className="primary-btn copy-btn" disabled={rotationBusy}>{rotationBusy ? <><LoaderCircle className="spin" size={17}/> Aggiornamento in corso…</> : <><ShieldCheck size={17}/> Ricifra e aggiorna la frase</>}</button></form>{rotationProgress && <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/>{rotationProgress}</div>}</div></div>}
       {previewUrl && <div className="modal-backdrop" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><div className="share-modal video-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><X size={18}/></button><div className="section-kicker">DECIFRATO SOLO IN MEMORIA</div><h2>{previewName}</h2><div className="video-player-wrap"><video ref={videoElementRef} src={previewUrl} controls autoPlay playsInline style={{width:'100%',maxHeight:'60vh',marginTop:16,background:'#000'}}/><button className="fullscreen-btn" onClick={requestVideoFullscreen}><Maximize2 size={17}/> Schermo intero</button></div></div></div>}
       {renameItem && <div className="modal-backdrop" onClick={() => !renameBusy && setRenameItem(null)}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => !renameBusy && setRenameItem(null)}><X size={18}/></button><div className="modal-icon"><Pencil size={21}/></div><div className="section-kicker">MODIFICA VIDEO</div><h2>Rinomina video</h2><p>Modifica il nome con cui compare nella tua libreria. Il contenuto cifrato non viene modificato.</p><form onSubmit={saveRename}><input className="rename-input" value={renameValue} onChange={e => setRenameValue(e.target.value)} maxLength={100} autoFocus placeholder="Nome del video"/><button className="primary-btn copy-btn" disabled={renameBusy}>{renameBusy ? <LoaderCircle className="spin" size={17}/> : <Check size={17}/>} Salva nome</button></form></div></div>}
-      {shareItem && <div className="modal-backdrop" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><X size={18}/></button><div className="modal-icon"><Share2 size={21}/></div><div className="section-kicker">CONDIVISIONE SICURA</div><h2>Condividi questo video</h2><p>Il link temporaneo crea una nuova copia del video con la filigrana VAULT incorporata nei fotogrammi. Il tuo originale resta invariato. In alternativa puoi inviare una copia normale del file.</p><div className="share-file"><Film size={17}/><span>{shareItem.displayName || getDisplayName(shareItem.name)}</span></div><button className="secondary-share-btn" disabled={shareBusy} onClick={createTemporaryLink}>{shareBusy && !copyFile ? <LoaderCircle className="spin" size={16}/> : <Clock3 size={16}/>} Crea link valido 1 ora</button>{shareUrl && <><div className="share-link">{shareUrl}</div><button className="primary-btn copy-btn" onClick={copyShare}>{copied ? <><Check size={17}/> Link copiato</> : <><Copy size={17}/> Copia link</>}</button></>}<div className="share-divider">OPPURE</div><button className="primary-btn copy-btn" disabled={shareBusy} onClick={copyFile ? sendPreparedCopy : prepareCopy}>{shareBusy ? <><LoaderCircle className="spin" size={17}/> Preparo la copia…</> : copyFile ? <><Share2 size={17}/> Invia la copia</> : <><Download size={17}/> Prepara una copia da inviare</>}</button><div className="expiry-note"><ShieldCheck size={14}/> La copia inviata non dipende da Vault e non scade. Il link dura 60 minuti e il video condiviso contiene la filigrana anche se viene scaricato.</div></div></div>}
+      {shareItem && <div className="modal-backdrop" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><X size={18}/></button><div className="modal-icon"><Share2 size={21}/></div><div className="section-kicker">CONDIVISIONE SICURA</div><h2>Condividi questo video</h2><p>Il link temporaneo crea una nuova copia del video con la filigrana VAULT incorporata nei fotogrammi. Il tuo originale resta invariato. In alternativa puoi inviare una copia normale del file.</p><div className="share-file"><Film size={17}/><span>{shareItem.displayName || getDisplayName(shareItem.name)}</span></div><button className="secondary-share-btn" disabled={shareBusy} onClick={createTemporaryLink}>{shareBusy && !copyFile ? <LoaderCircle className="spin" size={16}/> : <Clock3 size={16}/>} Crea link valido 1 ora</button>{shareBusy && shareProgress && <div className="expiry-note" role="status"><LoaderCircle className="spin" size={14}/>{shareProgress}</div>}{shareUrl && <><div className="share-link">{shareUrl}</div><button className="primary-btn copy-btn" onClick={copyShare}>{copied ? <><Check size={17}/> Link copiato</> : <><Copy size={17}/> Copia link</>}</button></>}<div className="share-divider">OPPURE</div><button className="primary-btn copy-btn" disabled={shareBusy} onClick={copyFile ? sendPreparedCopy : prepareCopy}>{shareBusy ? <><LoaderCircle className="spin" size={17}/> Preparo la copia…</> : copyFile ? <><Share2 size={17}/> Invia la copia</> : <><Download size={17}/> Prepara una copia da inviare</>}</button><div className="expiry-note"><ShieldCheck size={14}/> La copia inviata non dipende da Vault e non scade. Il link dura 60 minuti e il video condiviso contiene la filigrana anche se viene scaricato.</div></div></div>}
     </main>
   );
 }
