@@ -197,6 +197,14 @@ function getDisplayName(name) {
   return name.replace(/^[0-9a-f-]{30,}-/i, '').replace(/\.vlt$/i, '');
 }
 
+function metadataStoragePath(userId, storagePath) {
+  if (typeof storagePath === 'string' && storagePath.startsWith('google:')) {
+    const [, accountId, fileId] = storagePath.split(':');
+    return userId + '/_google/' + accountId + '/' + fileId;
+  }
+  return storagePath;
+}
+
 async function sealVideoMetadata(metadata, key) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
   const plain = new TextEncoder().encode(JSON.stringify(metadata));
@@ -580,11 +588,11 @@ function App() {
       setGoogleDriveError(driveError.message || 'Google Drive non è momentaneamente disponibile.');
     }
     const allItems = [...b2Items, ...driveRows];
-    const allMetadataPaths = allItems.map(item => item.path);
+    const allMetadataPaths = allItems.map(item => metadataStoragePath(session.user.id, item.path));
     try {
       const metadataMap = await loadEncryptedVideoMetadata(session.user.id, allMetadataPaths, vaultKey);
       for (const item of allItems) {
-        const metadata = metadataMap.get(item.path);
+        const metadata = metadataMap.get(metadataStoragePath(session.user.id, item.path));
         if (metadata) {
           item.displayName = metadata.name;
           item.mime = metadata.mime;
@@ -777,11 +785,11 @@ function App() {
 
       const passphraseMetadata = await loadEncryptedVideoMetadata(
         session.user.id,
-        allItems.map(item => item.path),
+        allItems.map(item => metadataStoragePath(session.user.id, item.path)),
         vaultKey
       );
       for (const item of allItems) {
-        const metadata = passphraseMetadata.get(item.path);
+        const metadata = passphraseMetadata.get(metadataStoragePath(session.user.id, item.path));
         if (metadata) {
           item.displayName = metadata.name;
           item.mime = metadata.mime;
@@ -810,8 +818,8 @@ function App() {
           if (item.provider === 'google') {
             const saved = await googleUpload(session, item.accountId, newName, encrypted);
             const newMetadataPath = 'google:' + item.accountId + ':' + saved.id;
-            await saveEncryptedVideoMetadata(session.user.id, newMetadataPath, { name: item.displayName, mime: item.mime }, newKey);
-            stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id, metadataPath: newMetadataPath });
+            await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newMetadataPath), { name: item.displayName, mime: item.mime }, newKey);
+            stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id, metadataPath: metadataStoragePath(session.user.id, newMetadataPath) });
             const savedCopy = await googleDownload(session, item.accountId, saved.id, saved.size);
             await decryptVideo(savedCopy, newKey, item.mime);
           } else {
@@ -836,7 +844,7 @@ function App() {
           for (const fileId of oldGoogleIds) {
             await googleRequest(session, { action: 'delete', accountId: account.id, fileId });
           }
-          const oldGooglePaths = allItems.filter(item => item.provider === 'google' && item.accountId === account.id).map(item => item.path);
+          const oldGooglePaths = allItems.filter(item => item.provider === 'google' && item.accountId === account.id).map(item => metadataStoragePath(session.user.id, item.path));
           if (oldGooglePaths.length) await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).in('storage_path', oldGooglePaths);
         }
         setVaultKey(newKey);
@@ -988,7 +996,7 @@ function App() {
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
           const drivePath = 'google:' + googleAccountId + ':' + saved.id;
-          await saveEncryptedVideoMetadata(session.user.id, drivePath, { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
+          await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
           uploadedDriveItems.push({
             id: 'google-' + googleAccountId + '-' + saved.id,
             fileId: saved.id,
@@ -1084,9 +1092,9 @@ function App() {
     }
     setRenameBusy(false);
     try {
-      await saveEncryptedVideoMetadata(session.user.id, newPath, { name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
+      await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newPath), { name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
       if (renameItem.path !== newPath) {
-        await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', renameItem.path);
+        await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, renameItem.path));
       }
     } catch (metadataError) {
       setError('Video rinominato, ma i metadati cifrati non sono stati aggiornati: ' + metadataError.message);
@@ -1124,8 +1132,7 @@ function App() {
     let shareRecordId = '';
     try {
       const shareId = crypto.randomUUID();
-      const safeName = (shareItem.displayName || getDisplayName(shareItem.name)).normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-90) || 'video';
-      sharePath = session.user.id + '/_shares/' + shareId + '/' + safeName + (shareItem.encrypted ? '.vlt' : '');
+      sharePath = session.user.id + '/_shares/' + shareId + '/video' + (shareItem.encrypted ? '.vlt' : '.bin');
       if (shareItem.provider === 'google') {
         const encryptedSource = await googleDownload(session, shareItem.accountId, shareItem.fileId, shareItem.size);
         await b2Upload(session, sharePath, encryptedSource);
@@ -1234,7 +1241,7 @@ function App() {
       }
     } catch (deleteError) { setError(deleteError.message); return; }
     {
-      await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', item.path);
+      await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, item.path));
       await logActivity(session.user.id, 'video_deleted', item.displayName || getDisplayName(item.name), 'Video eliminato dalla libreria');
       setVideos(current => current.filter(v => v.id !== item.id));
       if (shareItem?.id === item.id) {
