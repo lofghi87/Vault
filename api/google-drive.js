@@ -74,6 +74,24 @@ export default async function handler(req, res) {
       })) });
     }
 
+    if (action === 'quota') {
+      const account = await getGoogleAccount(admin, user.id, req.body.accountId);
+      const accessToken = await getGoogleAccessToken(admin, account);
+      const response = await googleApi(accessToken, '/drive/v3/about?fields=storageQuota(limit,usage,usageInDrive,usageInDriveTrash)');
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok || !result.storageQuota) {
+        const reason = result.error?.message || 'Google non ha restituito i dati dello spazio Drive.';
+        throw new Error(reason);
+      }
+      const limitBytes = result.storageQuota.limit == null ? null : Number(result.storageQuota.limit);
+      const usedBytes = Number(result.storageQuota.usage || 0);
+      return send(res, 200, { data: {
+        limitBytes,
+        usedBytes,
+        availableBytes: limitBytes == null ? null : Math.max(0, limitBytes - usedBytes),
+      } });
+    }
+
     if (action === 'list') {
       const account = await getGoogleAccount(admin, user.id, req.body.accountId);
       const accessToken = await getGoogleAccessToken(admin, account);
