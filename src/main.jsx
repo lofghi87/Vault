@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
-import { LockKeyhole, ShieldCheck, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, FolderPlus, ArrowDownWideNarrow } from 'lucide-react';
+import { LockKeyhole, ShieldCheck, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone } from 'lucide-react';
 import './styles.css';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -195,10 +195,6 @@ function App() {
   const [incomingShareFile, setIncomingShareFile] = useState(null);
   const [incomingShareError, setIncomingShareError] = useState('');
   const [thumbnails, setThumbnails] = useState({});
-  const [folders, setFolders] = useState(['Generale']);
-  const [activeFolder, setActiveFolder] = useState('Tutte');
-  const [sortMode, setSortMode] = useState('newest');
-  const [encryptionFilter, setEncryptionFilter] = useState('all');
   const [accountOpen, setAccountOpen] = useState(false);
   const [accountName, setAccountName] = useState(session?.user?.user_metadata?.display_name || '');
   const [accountEmail, setAccountEmail] = useState('');
@@ -208,7 +204,6 @@ function App() {
   const [securityLoading, setSecurityLoading] = useState(false);
   const [activity, setActivity] = useState([]);
   const [shares, setShares] = useState([]);
-  const [folderCreateBusy, setFolderCreateBusy] = useState(false);
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted');
   const [nowTick, setNowTick] = useState(() => Date.now());
   const notifiedShareIds = useRef(new Set());
@@ -279,19 +274,9 @@ function App() {
     let entries;
     try { entries = await b2ListAll(session); }
     catch (listError) { setError('Non riesco a caricare i video da Backblaze: ' + listError.message); setVideos([]); setLoadingVideos(false); return; }
-    const { data: metadataRows, error: metadataError } = await supabase
-      .from('vault_video_meta')
-      .select('storage_path,folder_name')
-      .eq('user_id', session.user.id);
-    if (metadataError) {
-      setError('Non riesco a caricare le cartelle: ' + metadataError.message);
-      setLoadingVideos(false);
-      return;
-    }
-    const folderByPath = new Map((metadataRows || []).map(row => [row.storage_path, row.folder_name]));
     const withUrls = entries.map(item => {
       const path = item.path || (session.user.id + '/' + item.name);
-      return { ...item, path, folder: folderByPath.get(path) || 'Generale', encrypted: item.name.endsWith('.vlt'), displayName: getDisplayName(item.name), size: item.metadata?.size || 0, mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || '') };
+      return { ...item, path, encrypted: item.name.endsWith('.vlt'), displayName: getDisplayName(item.name), size: item.metadata?.size || 0, mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || '') };
     });
     setVideos(withUrls);
     setLoadingVideos(false);
@@ -310,7 +295,6 @@ function App() {
     } else {
       setShares([]);
       setActivity([]);
-      setFolders(['Generale']);
     }
   }, [session?.user?.id]);
 
@@ -474,11 +458,6 @@ function App() {
       try {
         const encrypted = await encryptVideo(file, vaultKey);
         await b2Upload(session, path, encrypted);
-        const { error: metaError } = await supabase.from('vault_video_meta').upsert(
-          { user_id: session.user.id, storage_path: path, folder_name: 'Generale', updated_at: new Date().toISOString() },
-          { onConflict: 'user_id,storage_path' }
-        );
-        if (metaError) console.warn('Video caricato, ma cartella non salvata:', metaError.message);
         await logActivity(session.user.id, 'video_uploaded', file.name, 'Video caricato e cifrato sul dispositivo');
       } catch (uploadError) {
         setError('Errore durante la cifratura o il caricamento di ' + file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
@@ -535,8 +514,6 @@ function App() {
     try { await b2Move(session, renameItem.path, newPath); }
     catch (moveError) { setRenameBusy(false); setError('Non sono riuscito a rinominare il video: ' + moveError.message); return; }
     setRenameBusy(false);
-    const { error: metaError } = await supabase.from('vault_video_meta').update({ storage_path: newPath, updated_at: new Date().toISOString() }).eq('user_id', session.user.id).eq('storage_path', renameItem.path);
-    if (metaError) setError('Video rinominato, ma cartella non aggiornata: ' + metaError.message);
     const { error: sharesMoveError } = await supabase.from('vault_shares').update({ original_path: newPath, file_name: clean + extension }).eq('user_id', session.user.id).eq('original_path', renameItem.path).is('revoked_at', null);
     if (sharesMoveError) setError('Video rinominato, ma non ho aggiornato il collegamento dei link già creati: ' + sharesMoveError.message);
     await logActivity(session.user.id, 'video_renamed', clean, 'Video rinominato');
@@ -687,13 +664,12 @@ function App() {
   async function loadSecurityData() {
     if (!session?.user?.id) return;
     setSecurityLoading(true);
-    const [shareResult, activityResult, folderResult] = await Promise.all([
+    const [shareResult, activityResult] = await Promise.all([
       supabase.from('vault_shares').select('*').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit(50),
-      supabase.from('vault_activity').select('id,event_type,item_name,details,created_at').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit(40),
-      supabase.from('vault_video_folders').select('name').eq('user_id', session.user.id).order('name')
+      supabase.from('vault_activity').select('id,event_type,item_name,details,created_at').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit((40)
     ]);
-    if (shareResult.error || activityResult.error || folderResult.error) {
-      setError('Non riesco a caricare il centro sicurezza: ' + (shareResult.error || activityResult.error || folderResult.error).message);
+    if (shareResult.error || activityResult.error) {
+      setError('Non riesco a caricare il centro sicurezza: ' + (shareResult.error || activityResult.error).message);
     } else {
       let shareRows = shareResult.data || [];
       const expiredPending = shareRows.filter(row => !row.revoked_at && new Date(row.expires_at).getTime() <= Date.now());
@@ -709,7 +685,6 @@ function App() {
       }
       setShares(shareRows);
       setActivity(activityResult.data || []);
-      setFolders(['Generale', ...new Set((folderResult.data || []).map(row => row.name).filter(name => name !== 'Generale'))]);
     }
     setSecurityLoading(false);
   }
@@ -723,31 +698,6 @@ function App() {
     await logActivity(session.user.id, 'share_revoked', share.file_name, 'Link temporaneo revocato e copia condivisa rimossa');
     await loadSecurityData();
     setMessage('Link revocato: la copia temporanea è stata rimossa. Le copie già scaricate non possono essere richiamate.');
-  }
-
-  async function createFolder() {
-    const value = window.prompt('Nome della nuova cartella (massimo 40 caratteri):');
-    if (value === null) return;
-    const name = value.trim().replace(/[\/\\]/g, '-').slice(0, 40);
-    if (!name) { setError('Inserisci un nome di cartella valido.'); return; }
-    if (name.toLocaleLowerCase('it') === 'tutte') { setError('Il nome “Tutte” è riservato al filtro della libreria.'); return; }
-    if (folders.some(folder => folder.toLowerCase() === name.toLowerCase())) { setError('Esiste già una cartella con questo nome.'); return; }
-    setFolderCreateBusy(true);
-    const { error: folderError } = await supabase.from('vault_video_folders').insert({ user_id: session.user.id, name });
-    setFolderCreateBusy(false);
-    if (folderError) { setError('Non riesco a creare la cartella: ' + folderError.message); return; }
-    setFolders(current => [...current, name].sort((a, b) => a.localeCompare(b, 'it')));
-    await logActivity(session.user.id, 'folder_created', name, 'Nuova cartella creata');
-    setActiveFolder(name);
-  }
-
-  async function moveToFolder(item, folderName) {
-    const { error: folderError } = await supabase.from('vault_video_meta').upsert({
-      user_id: session.user.id, storage_path: item.path, folder_name: folderName, updated_at: new Date().toISOString()
-    }, { onConflict: 'user_id,storage_path' });
-    if (folderError) { setError('Non riesco a spostare il video: ' + folderError.message); return; }
-    setVideos(current => current.map(video => video.id === item.id ? { ...video, folder: folderName } : video));
-    await logActivity(session.user.id, 'video_moved', item.displayName || getDisplayName(item.name), 'Spostato nella cartella ' + folderName);
   }
 
   async function saveAccountName() {
@@ -806,19 +756,9 @@ function App() {
     }
   }
 
-  const visibleVideos = useMemo(() => {
-    const filtered = videos.filter(video =>
-      (video.displayName || video.name).toLowerCase().includes(search.toLowerCase()) &&
-      (activeFolder === 'Tutte' || (video.folder || 'Generale') === activeFolder) &&
-      (encryptionFilter === 'all' || (encryptionFilter === 'encrypted' ? video.encrypted : !video.encrypted))
-    );
-    return filtered.sort((a, b) => {
-      if (sortMode === 'name') return (a.displayName || a.name).localeCompare(b.displayName || b.name, 'it');
-      if (sortMode === 'size') return (b.size || 0) - (a.size || 0);
-      const delta = new Date(a.created_at || 0) - new Date(b.created_at || 0);
-      return sortMode === 'oldest' ? delta : -delta;
-    });
-  }, [videos, search, activeFolder, encryptionFilter, sortMode]);
+  const visibleVideos = useMemo(() => videos
+    .filter(video => (video.displayName || video.name).toLowerCase().includes(search.toLowerCase()))
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)), [videos, search]);
   const securityAlerts = shares.filter(share => !share.revoked_at && new Date(share.expires_at).getTime() <= nowTick + 15 * 60 * 1000);
   useEffect(() => {
     if (!notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
@@ -921,14 +861,14 @@ function App() {
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
       {error && <div className="notice error dashboard-notice"><AlertCircle size={16}/>{error}<button onClick={() => setError('')}><X size={15}/></button></div>}
       <section className="library">
-        <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{videos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div><select className="library-select" value={activeFolder} onChange={e => setActiveFolder(e.target.value)} aria-label="Filtra per cartella"><option value="Tutte">Tutte le cartelle</option>{folders.map(folder => <option key={folder} value={folder}>{folder}</option>)}</select><select className="library-select" value={sortMode} onChange={e => setSortMode(e.target.value)} aria-label="Ordina video"><option value="newest">Più recenti</option><option value="oldest">Meno recenti</option><option value="name">Nome A–Z</option><option value="size">Dimensione</option></select><select className="library-select" value={encryptionFilter} onChange={e => setEncryptionFilter(e.target.value)} aria-label="Filtra cifratura"><option value="all">Tutti i file</option><option value="encrypted">Solo cifrati</option><option value="legacy">Non cifrati</option></select><button className="folder-add-btn" type="button" onClick={createFolder} disabled={folderCreateBusy}><FolderPlus size={15}/> Nuova cartella</button></div></div>
+        <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{videos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div></div></div>
         {loadingVideos ? <div className="empty-state"><LoaderCircle className="spin" size={24}/><p>Sto aprendo la cassaforte…</p></div> : visibleVideos.length === 0 ? (
           <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{videos.length ? 'Nessun risultato' : 'La tua cassaforte è vuota'}</h3><p>{videos.length ? 'Prova con un altro nome.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.'}</p>{!videos.length && <label className="secondary-btn"><UploadCloud size={17}/> Seleziona video<input type="file" accept="video/*" multiple hidden onChange={handleUpload}/></label>}</div>
         ) : (
           <div className="video-grid">{visibleVideos.map(item => (
             <article className="video-card" key={item.id}>
               <button className="video-preview encrypted-preview" style={thumbnails[item.path] ? { backgroundImage: 'linear-gradient(#0002,#0002),url("' + thumbnails[item.path] + '")', backgroundSize: 'cover', backgroundPosition: 'center' } : undefined} disabled={openingVideoId !== null} onClick={() => item.encrypted ? openEncryptedVideo(item) : setError('Questo è un vecchio video non cifrato. Scaricalo e ricaricalo dopo la modifica per proteggerlo.') }>{thumbnails[item.path] ? <span className="thumb-play"><Play size={24} fill="currentColor"/></span> : <div className="video-placeholder">{openingVideoId === item.id ? <><LoaderCircle className="spin" size={32}/><span>APERTURA IN CORSO…</span></> : <><LockKeyhole size={32}/><span>{item.encrypted ? 'CIFRATO' : 'NON CIFRATO'}</span></>}</div>}<span className="private-tag"><LockKeyhole size={11}/> {item.encrypted ? 'AES-256' : 'VECCHIO FILE'}</span></button>
-              <div className="video-info"><h3 title={item.displayName}>{item.displayName}</h3><div className="video-meta"><span><Clock3 size={13}/>{formatDate(item.created_at)}</span><span>{formatSize(item.size)}</span></div><label className="folder-row"><FolderPlus size={13}/><select className="video-folder-select" value={item.folder || 'Generale'} onChange={e => moveToFolder(item, e.target.value)} aria-label={'Cartella per ' + item.displayName}>{folders.map(folder => <option key={folder} value={folder}>{folder}</option>)}</select></label><div className="video-actions"><button className="share-btn" disabled={openingVideoId !== null} onClick={() => createShare(item)}><Share2 size={14}/> Condividi</button>{item.encrypted && <button className="delete-btn" onClick={() => beginRename(item)} title="Modifica nome"><Pencil size={16}/></button>}<button className="delete-btn" onClick={() => deleteVideo(item)} title="Elimina video"><Trash2 size={16}/></button></div></div>
+              <div className="video-info"><h3 title={item.displayName}>{item.displayName}</h3><div className="video-meta"><span><Clock3 size={13}/>{formatDate(item.created_at)}</span><span>{formatSize(item.size)}</span></div><div className="video-actions"><button className="share-btn" disabled={openingVideoId !== null} onClick={() => createShare(item)}><Share2 size={14}/> Condividi</button>{item.encrypted && <button className="delete-btn" onClick={() => beginRename(item)} title="Modifica nome"><Pencil size={16}/></button>}<button className="delete-btn" onClick={() => deleteVideo(item)} title="Elimina video"><Trash2 size={16}/></button></div></div>
             </article>
           ))}</div>
         )}
@@ -936,7 +876,7 @@ function App() {
       <footer className="dash-footer"><span><ShieldCheck size={14}/> I video sono cifrati sul dispositivo prima del caricamento su Backblaze.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
       {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
       {accountOpen && <div className="modal-backdrop" onClick={() => !accountBusy && setAccountOpen(false)}><div className="share-modal account-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !accountBusy && setAccountOpen(false)}><X size={18}/></button><div className="modal-icon"><UserRound size={21}/></div><div className="section-kicker">IL TUO ACCOUNT</div><h2>Profilo e credenziali</h2><p>Gestisci i dati dell’account. La frase segreta Vault resta separata dalla password.</p><div className="account-field"><label>Email attuale</label><div className="account-current">{session.user.email}</div></div><label>Nome visualizzato</label><div className="input-wrap"><UserRound size={17}/><input value={accountName} onChange={e => setAccountName(e.target.value)} maxLength={60} placeholder="Nome profilo"/></div><button className="primary-btn copy-btn" type="button" disabled={accountBusy} onClick={saveAccountName}>{accountBusy ? <LoaderCircle className="spin" size={16}/> : <Check size={16}/>} Salva nome</button><div className="account-divider"/><label>Nuovo indirizzo email</label><div className="input-wrap"><Mail size={17}/><input type="email" value={accountEmail} onChange={e => setAccountEmail(e.target.value)} autoComplete="email" placeholder="nuova@email.com"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy} onClick={requestAccountEmailChange}>Richiedi cambio email</button><p className="card-sub account-hint">Il cambio potrebbe richiedere la conferma tramite email.</p><div className="account-divider"/><label>Nuova password dell’account</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={newAccountPassword} onChange={e => setNewAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Almeno 8 caratteri"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy || newAccountPassword.length < 8} onClick={updateAccountPassword}>Aggiorna password</button>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}</div></div>}
-      {securityOpen && <div className="modal-backdrop" onClick={() => setSecurityOpen(false)}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSecurityOpen(false)}><X size={18}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata',folder_created:'Cartella creata',video_moved:'Video spostato'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
+      {securityOpen && <div className="modal-backdrop" onClick={() => setSecurityOpen(false)}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSecurityOpen(false)}><X size={18}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
       {settingsOpen && <div className="modal-backdrop" onClick={() => !rotationBusy && setSettingsOpen(false)}><div className="share-modal settings-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={rotationBusy} onClick={() => setSettingsOpen(false)}><X size={18}/></button><div className="modal-icon"><KeyRound size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI SICUREZZA</div><h2>Modifica frase segreta</h2><p>Vault ricifrerà tutti i video con la nuova frase. Le frasi vengono elaborate solo sul dispositivo e non vengono inviate ai server.</p><form onSubmit={changeVaultPassphrase}><label>Nuova frase segreta</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphrase ? 'text' : 'password'} value={newVaultPassphrase} onChange={e => setNewVaultPassphrase(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Almeno 12 caratteri"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphrase(v => !v)} aria-label="Mostra nuova frase">{showNewVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><label>Conferma nuova frase</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphraseConfirm ? 'text' : 'password'} value={newVaultPassphraseConfirm} onChange={e => setNewVaultPassphraseConfirm(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Ripeti la nuova frase"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphraseConfirm(v => !v)} aria-label="Mostra conferma nuova frase">{showNewVaultPassphraseConfirm ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><p className="card-sub settings-warning">Non chiudere la pagina durante la procedura. Gli originali vengono eliminati solo dopo la verifica di tutte le nuove copie.</p><button className="primary-btn copy-btn" disabled={rotationBusy}>{rotationBusy ? <><LoaderCircle className="spin" size={17}/> Aggiornamento in corso…</> : <><ShieldCheck size={17}/> Ricifra e aggiorna la frase</>}</button></form>{rotationProgress && <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/>{rotationProgress}</div>}</div></div>}
       {previewUrl && <div className="modal-backdrop" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><div className="share-modal video-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><X size={18}/></button><div className="section-kicker">DECIFRATO SOLO IN MEMORIA</div><h2>{previewName}</h2><div className="video-player-wrap"><video ref={videoElementRef} src={previewUrl} controls autoPlay playsInline style={{width:'100%',maxHeight:'60vh',marginTop:16,background:'#000'}}/><button className="fullscreen-btn" onClick={requestVideoFullscreen}><Maximize2 size={17}/> Schermo intero</button></div></div></div>}
       {renameItem && <div className="modal-backdrop" onClick={() => !renameBusy && setRenameItem(null)}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => !renameBusy && setRenameItem(null)}><X size={18}/></button><div className="modal-icon"><Pencil size={21}/></div><div className="section-kicker">MODIFICA VIDEO</div><h2>Rinomina video</h2><p>Modifica il nome con cui compare nella tua libreria. Il contenuto cifrato non viene modificato.</p><form onSubmit={saveRename}><input className="rename-input" value={renameValue} onChange={e => setRenameValue(e.target.value)} maxLength={100} autoFocus placeholder="Nome del video"/><button className="primary-btn copy-btn" disabled={renameBusy}>{renameBusy ? <LoaderCircle className="spin" size={17}/> : <Check size={17}/>} Salva nome</button></form></div></div>}
