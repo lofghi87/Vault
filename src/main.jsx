@@ -34,7 +34,52 @@ async function b2Move(session,from,to){ await b2Request(session,{action:'move',f
 async function b2Copy(session,from,to){ await b2Request(session,{action:'copy',from,to}); }
 async function b2SignedUrl(session,path,seconds=3600){ const r=await b2Request(session,{action:'sign',path,seconds}); return r.url; }
 
+async function googleRequest(session, payload) {
+  if (!session?.access_token) throw new Error('Sessione Vault non valida.');
+  const response = await fetch('/api/google-drive', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + session.access_token,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify(payload),
+  });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || 'Operazione Google Drive non riuscita.');
+  return result;
+}
 
+async function googleDownload(session, accountId, fileId) {
+  const query = new URLSearchParams({ action: 'download', accountId, fileId });
+  const response = await fetch('/api/google-drive?' + query.toString(), {
+    headers: { Authorization: 'Bearer ' + session.access_token },
+    cache: 'no-store',
+  });
+  if (!response.ok) {
+    const result = await response.json().catch(() => ({}));
+    throw new Error(result.error || 'Download da Google Drive non riuscito.');
+  }
+  return response.blob();
+}
+
+async function googleUpload(session, accountId, name, encryptedBlob) {
+  const started = await googleRequest(session, {
+    action: 'startUpload', accountId, name, size: encryptedBlob.size,
+  });
+  const response = await fetch(started.uploadUrl, {
+    method: 'PUT',
+    headers: { 'Content-Type': 'application/octet-stream' },
+    body: encryptedBlob,
+  });
+  const uploaded = await response.json().catch(() => ({}));
+  if (!response.ok || !uploaded.id) {
+    throw new Error('Caricamento su Google Drive non riuscito. Controlla la connessione e riprova.');
+  }
+  const verified = await googleRequest(session, {
+    action: 'verify', accountId, fileId: uploaded.id, expectedSize: encryptedBlob.size,
+  });
+  return verified.data;
+}
 
 function getDisplayName(name) {
   return name.replace(/^[0-9a-f-]{30,}-/i, '').replace(/\.vlt$/i, '');
@@ -162,6 +207,11 @@ function App() {
   const [error, setError] = useState('');
   const [videos, setVideos] = useState([]);
   const [storageQuota, setStorageQuota] = useState(null);
+  const [googleAccounts, setGoogleAccounts] = useState([]);
+  const [storageDestination, setStorageDestination] = useState('backblaze');
+  const [googleDriveError, setGoogleDriveError] = useState('');
+  const [googleConnectBusy, setGoogleConnectBusy] = useState(false);
+  const [googleDisconnectId, setGoogleDisconnectId] = useState('');
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progressName, setProgressName] = useState('');
@@ -272,14 +322,68 @@ function App() {
     if (!session?.user?.id || !vaultKey) return;
     setLoadingVideos(true);
     setError('');
-    let entries;
-    try { entries = await b2ListAll(session); }
-    catch (listError) { setError('Non riesco a caricare i video da Backblaze: ' + listError.message); setVideos([]); setLoadingVideos(false); return; }
-    const withUrls = entries.map(item => {
+    let entries = [];
+    try {
+      entries = await b2ListAll(session);
+    } catch (listError) {
+      setError('Non riesco a caricare i video da Backblaze: ' + listError.message);
+    }
+    const b2Items = entries.map(item => {
       const path = item.path || (session.user.id + '/' + item.name);
-      return { ...item, path, encrypted: item.name.endsWith('.vlt'), displayName: getDisplayName(item.name), size: item.metadata?.size || 0, mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || '') };
+      return {
+        ...item,
+        id: 'b2-' + item.id,
+        path,
+        provider: 'backblaze',
+        providerLabel: 'Backblaze B2',
+        encrypted: item.name.endsWith('.vlt'),
+        displayName: getDisplayName(item.name),
+        size: item.metadata?.size || 0,
+        mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || ''),
+      };
     });
-    setVideos(withUrls);
+
+    let driveRows = [];
+    let connectedAccounts = [];
+    try {
+      const accountsResult = await googleRequest(session, { action: 'accounts' });
+      connectedAccounts = accountsResult.data || [];
+      setGoogleDriveError('');
+      for (const account of connectedAccounts) {
+        try {
+          const listResult = await googleRequest(session, { action: 'list', accountId: account.id });
+          const accountFiles = (listResult.data || [])
+            .filter(file => file.name?.endsWith('.vlt'))
+            .map(file => ({
+              id: 'google-' + account.id + '-' + file.id,
+              fileId: file.id,
+              accountId: account.id,
+              accountEmail: account.email,
+              path: 'google:' + account.id + ':' + file.id,
+              name: file.name,
+              displayName: getDisplayName(file.name),
+              size: Number(file.size || 0),
+              created_at: file.created_at,
+              mime: getOriginalVideoMime(file.name),
+              encrypted: true,
+              provider: 'google',
+              providerLabel: 'Google Drive · ' + account.email,
+            }));
+          driveRows.push(...accountFiles);
+          account.status = 'connected';
+          account.error = '';
+        } catch (accountError) {
+          account.status = 'error';
+          account.error = accountError.message || 'Ricollega questo account Google.';
+          setGoogleDriveError(accountError.message || 'Un account Google deve essere ricollegato.');
+        }
+      }
+    } catch (driveError) {
+      setGoogleDriveError(driveError.message || 'Google Drive non è momentaneamente disponibile.');
+    }
+    setGoogleAccounts(connectedAccounts);
+    setVideos([...b2Items, ...driveRows]);
+
     try {
       const quotaResult = await b2Request(session, { action: 'quota' });
       setStorageQuota(quotaResult.data || null);
@@ -295,6 +399,8 @@ function App() {
     else {
       setVideos([]);
       setStorageQuota(null);
+      setGoogleAccounts([]);
+      setGoogleDriveError('');
     }
   }, [session, vaultKey, loadVideos]);
 
