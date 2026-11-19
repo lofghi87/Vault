@@ -699,7 +699,7 @@ function App() {
             const savedCopy = await googleDownload(session, item.accountId, saved.id, saved.size);
             await decryptVideo(savedCopy, newKey, item.mime);
           } else {
-            const newPath = session.user.id + '/' + newName;
+            const newPath = session.user.id + '/Vault/' + newName;
             await b2Upload(session, newPath, encrypted);
             stagedItems.push({ provider: 'backblaze', path: newPath });
             const savedCopy = await b2Download(session, newPath);
@@ -836,7 +836,7 @@ function App() {
       setProgressName(file.name);
       const safeName = file.name.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
       const storedName = crypto.randomUUID() + '-' + safeName + '.vlt';
-      const path = session.user.id + '/' + storedName;
+      const path = session.user.id + '/Vault/' + storedName;
       try {
         const encrypted = await encryptVideo(file, vaultKey);
         if (isGoogleDestination) {
@@ -898,7 +898,7 @@ function App() {
     const extMatch = oldDisplay.match(/(\.[^.]+)$/);
     const extension = extMatch ? extMatch[1] : '';
     const newName = crypto.randomUUID() + '-' + clean + extension + '.vlt';
-    const newPath = renameItem.provider === 'google' ? renameItem.path : session.user.id + '/' + newName;
+    const newPath = renameItem.provider === 'google' ? renameItem.path : session.user.id + '/Vault/' + newName;
     setRenameBusy(true); setError('');
     try {
       if (renameItem.provider === 'google') {
