@@ -508,28 +508,60 @@ function App() {
     if (newVaultPassphrase.length < 12) { setError('La nuova frase deve contenere almeno 12 caratteri.'); return; }
     if (newVaultPassphrase !== newVaultPassphraseConfirm) { setError('Le due nuove frasi non coincidono.'); return; }
     if (newVaultPassphrase === vaultPassphrase) { setError('Scegli una frase diversa da quella attuale.'); return; }
-    if (!window.confirm('Vault creerà copie cifrate con la nuova frase, verificherà tutti i file e solo dopo eliminerà gli originali. Per sicurezza, i link temporanei attivi verranno revocati. Tieni aperta la pagina fino al termine. Vuoi continuare?')) return;
+    if (!window.confirm('Vault creerà nuove copie cifrate su ciascuno spazio, verificherà i file e solo dopo eliminerà gli originali. I link temporanei attivi verranno revocati. Tieni aperta la pagina fino al termine. Vuoi continuare?')) return;
 
     setRotationBusy(true);
     setRotationProgress('Preparazione della nuova chiave…');
     setError('');
-    const stagedPaths = [];
+    const stagedItems = [];
+    let replacementStarted = false;
     try {
       setRotationProgress('Revoca dei link temporanei…');
-      const { data: activeShares, error: activeSharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).is('revoked_at', null);
+      const { data: activeShares, error: activeSharesError } = await supabase
+        .from('vault_shares')
+        .select('id,storage_path')
+        .eq('user_id', session.user.id)
+        .is('revoked_at', null);
       if (activeSharesError) throw new Error('Non riesco a controllare i link temporanei: ' + activeSharesError.message);
       if (activeShares?.length) {
         await b2DeleteShareCopies(session, activeShares.map(share => share.storage_path));
-        const { error: markSharesError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', activeShares.map(share => share.id));
+        const { error: markSharesError } = await supabase
+          .from('vault_shares')
+          .update({ revoked_at: new Date().toISOString() })
+          .in('id', activeShares.map(share => share.id));
         if (markSharesError) console.warn('Copie dei link rimosse, ma alcuni record non sono stati aggiornati:', markSharesError.message);
       }
+
       const newKey = await deriveVaultKey(newVaultPassphrase, session.user.id);
       const allItems = [];
-      const pageSize = 100;
-      for (let offset = 0; ; offset += pageSize) {
-        const page = await b2ListAll(session);
-        allItems.push(...page);
-        break;
+      const b2Entries = await b2ListAll(session);
+      for (const item of b2Entries) {
+        allItems.push({
+          provider: 'backblaze',
+          name: item.name,
+          path: item.path || (session.user.id + '/' + item.name),
+          displayName: getDisplayName(item.name),
+          mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || 'video/mp4'),
+          encrypted: item.name.endsWith('.vlt'),
+        });
+      }
+
+      const accountsResult = await googleRequest(session, { action: 'accounts' });
+      const accounts = accountsResult.data || [];
+      for (const account of accounts) {
+        const listResult = await googleRequest(session, { action: 'list', accountId: account.id });
+        for (const item of (listResult.data || []).filter(file => file.name?.endsWith('.vlt'))) {
+          allItems.push({
+            provider: 'google',
+            accountId: account.id,
+            fileId: item.id,
+            name: item.name,
+            path: 'google:' + account.id + ':' + item.id,
+            displayName: getDisplayName(item.name),
+            mime: getOriginalVideoMime(item.name),
+            encrypted: true,
+          });
+        }
       }
 
       if (!allItems.length) {
@@ -539,46 +571,75 @@ function App() {
         await loadSecurityData();
         setMessage('Frase segreta aggiornata. La cassaforte era vuota.');
       } else {
-        const oldPaths = [];
         for (let index = 0; index < allItems.length; index++) {
           const item = allItems[index];
-          const oldPath = session.user.id + '/' + item.name;
-          const displayName = getDisplayName(item.name);
-          const mime = item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || 'video/mp4');
-          setRotationProgress('Cifratura e verifica ' + (index + 1) + ' di ' + allItems.length + ': ' + displayName);
-          const data = await b2Download(session, oldPath);
-          const plain = item.name.endsWith('.vlt') ? await decryptVideo(data, vaultKey, mime) : data;
+          setRotationProgress('Cifratura e verifica ' + (index + 1) + ' di ' + allItems.length + ': ' + item.displayName);
+          const data = item.provider === 'google'
+            ? await googleDownload(session, item.accountId, item.fileId)
+            : await b2Download(session, item.path);
+          const plain = item.encrypted ? await decryptVideo(data, vaultKey, item.mime) : data;
           const encrypted = await encryptVideo(plain, newKey);
-          // Verifica locale dell'integrità prima di caricare la nuova copia.
-          await decryptVideo(encrypted, newKey, mime);
-          const safeName = displayName.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
-          const newPath = session.user.id + '/' + crypto.randomUUID() + '-' + safeName + '.vlt';
-          await b2Upload(session, newPath, encrypted);
-          stagedPaths.push(newPath);
-          // Verifica anche la copia effettivamente salvata sul server.
-          const savedCopy = await b2Download(session, newPath);
-          await decryptVideo(savedCopy, newKey, mime);
-          oldPaths.push(oldPath);
+          await decryptVideo(encrypted, newKey, item.mime);
+          const safeName = item.displayName.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
+          const newName = crypto.randomUUID() + '-' + safeName + '.vlt';
+
+          if (item.provider === 'google') {
+            const saved = await googleUpload(session, item.accountId, newName, encrypted);
+            stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id });
+            const savedCopy = await googleDownload(session, item.accountId, saved.id);
+            await decryptVideo(savedCopy, newKey, item.mime);
+          } else {
+            const newPath = session.user.id + '/' + newName;
+            await b2Upload(session, newPath, encrypted);
+            stagedItems.push({ provider: 'backblaze', path: newPath });
+            const savedCopy = await b2Download(session, newPath);
+            await decryptVideo(savedCopy, newKey, item.mime);
+          }
         }
-        setRotationProgress('Tutti i video sono verificati. Sostituzione degli originali…');
-        await b2Delete(session, oldPaths);
+
+        setRotationProgress('Tutti i nuovi video sono verificati. Sostituzione degli originali…');
+        replacementStarted = true;
+        const oldB2Paths = allItems.filter(item => item.provider === 'backblaze').map(item => item.path);
+        if (oldB2Paths.length) await b2Delete(session, oldB2Paths);
+        for (const account of accounts) {
+          const oldGoogleIds = allItems
+            .filter(item => item.provider === 'google' && item.accountId === account.id)
+            .map(item => item.fileId);
+          for (const fileId of oldGoogleIds) {
+            await googleRequest(session, { action: 'delete', accountId: account.id, fileId });
+          }
+        }
         setVaultKey(newKey);
         setSettingsOpen(false);
-        await logActivity(session.user.id, 'vault_passphrase_changed', null, 'Frase segreta aggiornata: video ricifrati e link temporanei revocati');
+        await logActivity(session.user.id, 'vault_passphrase_changed', null, 'Frase segreta aggiornata: tutti i video cifrati su Backblaze e Google Drive sono stati verificati e ricifrati; link temporanei revocati');
         await loadSecurityData();
-        setMessage('Frase segreta aggiornata. Tutti i video sono stati ricifrati e verificati.');
+        setMessage('Frase segreta aggiornata. Tutti i video sono stati ricifrati e verificati nei rispettivi spazi.');
       }
       setNewVaultPassphrase('');
       setNewVaultPassphraseConfirm('');
       setVaultPassphrase('');
     } catch (e) {
-      if (stagedPaths.length) {
-        await b2Delete(session, stagedPaths);
+      if (!replacementStarted && stagedItems.length) {
+        for (const item of stagedItems) {
+          try {
+            if (item.provider === 'google') {
+              await googleRequest(session, { action: 'delete', accountId: item.accountId, fileId: item.fileId });
+            } else {
+              await b2Delete(session, [item.path]);
+            }
+          } catch (cleanupError) {
+            console.error('Pulizia della copia temporanea non riuscita:', cleanupError);
+          }
+        }
       }
-      setError('Modifica della frase non completata: ' + (e.message || 'errore sconosciuto') + ' I video originali sono stati mantenuti.');
+      const recoveryNote = replacementStarted
+        ? ' Le nuove copie verificate sono state conservate per sicurezza: controlla la libreria prima di ripetere la procedura.'
+        : ' I video originali sono stati mantenuti.';
+      setError('Modifica della frase non completata: ' + (e.message || 'errore sconosciuto') + recoveryNote);
     } finally {
       setRotationBusy(false);
       setRotationProgress('');
+      await loadVideos();
     }
   }
 
