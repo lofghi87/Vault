@@ -696,6 +696,25 @@ function App() {
         const samplePath = sample.path || (session.user.id + '/' + sample.name);
         const encryptedSample = await b2Download(session, samplePath);
         await decryptVideo(encryptedSample, candidateKey, getOriginalVideoMime(sample.name));
+      } else {
+        // Se l'archivio è solo su Google Drive, verifica la frase usando il file cifrato più piccolo.
+        const accountsResult = await googleRequest(session, { action: 'accounts' });
+        const accounts = accountsResult.data || [];
+        let googleSample = null;
+        for (const account of accounts) {
+          const listed = await googleRequest(session, { action: 'list', accountId: account.id });
+          const candidates = (listed.data || [])
+            .filter(file => file.name?.endsWith('.vlt'))
+            .map(file => ({ ...file, accountId: account.id }))
+            .sort((a, b) => Number(a.size || 0) - Number(b.size || 0));
+          if (candidates.length && (!googleSample || Number(candidates[0].size || 0) < Number(googleSample.size || 0))) {
+            googleSample = candidates[0];
+          }
+        }
+        if (googleSample) {
+          const encryptedSample = await googleDownload(session, googleSample.accountId, googleSample.id, googleSample.size);
+          await decryptVideo(encryptedSample, candidateKey, getOriginalVideoMime(googleSample.name));
+        }
       }
       setVaultKey(candidateKey);
       setVaultPassphrase('');
@@ -1016,7 +1035,7 @@ function App() {
         } else {
           await b2Upload(session, path, encrypted);
           await saveEncryptedVideoMetadata(session.user.id, path, { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
-          await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
+          await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
         }
       } catch (uploadError) {
         setError('Errore durante la cifratura o il caricamento di ' + file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
@@ -1292,7 +1311,7 @@ function App() {
     catch (removeError) { setError('Non riesco a rimuovere la copia condivisa: ' + removeError.message); return; }
     const { error: updateError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).eq('id', share.id).eq('user_id', session.user.id);
     if (updateError) setError('Copia condivisa rimossa, ma registro non aggiornato: ' + updateError.message);
-    await logActivity(session.user.id, 'share_revoked', share.file_name, 'Link temporaneo revocato e copia condivisa rimossa');
+    await logActivity(session.user.id, 'share_revoked', null, 'Link temporaneo revocato e copia condivisa rimossa');
     await loadSecurityData();
     setMessage('Link revocato: la copia temporanea è stata rimossa. Le copie già scaricate non possono essere richiamate.');
   }
@@ -1313,7 +1332,7 @@ function App() {
     const { error: updateError } = await supabase.auth.updateUser({ email: nextEmail });
     setAccountBusy(false);
     if (updateError) { setError('Non riesco a richiedere il cambio email: ' + updateError.message); return; }
-    await logActivity(session.user.id, 'email_change_requested', nextEmail, 'Richiesta di cambio email inviata');
+    await logActivity(session.user.id, 'email_change_requested', null, 'Richiesta di cambio email inviata');
     setMessage('Richiesta inviata. Controlla la posta e conferma il cambio secondo le istruzioni ricevute.');
   }
 
