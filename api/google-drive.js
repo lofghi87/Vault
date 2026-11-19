@@ -24,7 +24,7 @@ export default async function handler(req, res) {
       const fileId = String(req.query.fileId || '');
       if (!fileId || fileId.includes('/')) return send(res, 400, { error: 'File Google Drive non valido.' });
       const rangeHeader = req.headers.range;
-      if (rangeHeader && !/^bytes=\\d+-\\d+$/.test(rangeHeader)) {
+      if (rangeHeader && !/^bytes=\d+-\d+$/.test(rangeHeader)) {
         return send(res, 416, { error: 'Intervallo di download non valido.' });
       }
       const accessToken = await getGoogleAccessToken(admin, account);
