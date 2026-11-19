@@ -70,6 +70,9 @@ export default async function handler(req, res) {
     }
 
     if (action === 'migrate') {
+      const requestId = req.headers['x-vercel-id'] || 'unknown';
+      const startedAt = Date.now();
+      console.info('[Vault B2 migration] started', { requestId, userId });
       const sourceClient = createClient(process.env.VITE_SUPABASE_URL, process.env.VITE_SUPABASE_ANON_KEY, {
         auth: { persistSession: false, autoRefreshToken: false },
         global: { headers: { Authorization: 'Bearer ' + token } },
@@ -78,12 +81,16 @@ export default async function handler(req, res) {
       const skipped = [];
       const failures = [];
       const pageSize = 100;
+      let scanned = 0;
+      let pages = 0;
       for (let offset = 0; ; offset += pageSize) {
+        pages += 1;
         const { data: page, error: listError } = await sourceClient.storage.from('vault-videos').list(userId, {
           limit: pageSize, offset, sortBy: { column: 'created_at', order: 'asc' },
         });
         if (listError) throw new Error('Lettura elenco Supabase non riuscita: ' + listError.message);
         const items = (page || []).filter(item => item?.name && item?.id);
+        scanned += items.length;
         for (const item of items) {
           const key = safeKey(userId + '/' + item.name, userId);
           const expectedSize = Number(item.metadata?.size || 0);
@@ -107,6 +114,7 @@ export default async function handler(req, res) {
             const sourceResponse = await fetch(signed.signedUrl);
             if (!sourceResponse.ok || !sourceResponse.body) throw new Error('Download server-to-server da Supabase fallito (HTTP ' + sourceResponse.status + ').');
             const sourceLength = Number(sourceResponse.headers.get('content-length') || expectedSize);
+            if (!Number.isFinite(sourceLength) || sourceLength <= 0) throw new Error('Dimensione del file non valida o non disponibile.');
             if (expectedSize && sourceLength !== expectedSize) throw new Error('Dimensione ricevuta da Supabase diversa da quella attesa.');
             const bodyStream = Readable.fromWeb(sourceResponse.body);
             await s3.send(new PutObjectCommand({
@@ -129,8 +137,21 @@ export default async function handler(req, res) {
         }
         if (items.length < pageSize) break;
       }
+      const summary = {
+        requestId,
+        userId,
+        pages,
+        scanned,
+        copied: copied.length,
+        skipped: skipped.length,
+        failures: failures.length,
+        durationMs: Date.now() - startedAt,
+      };
+      console.info('[Vault B2 migration] finished', summary);
+      if (failures.length) console.warn('[Vault B2 migration] failures', failures.map(item => ({ error: item.error })));
       return send(res, failures.length ? 207 : 200, {
         data: { copied, skipped, failures, total: copied.length + skipped.length + failures.length },
+        summary,
         message: failures.length ? 'Copia parziale: gli originali su Supabase sono rimasti intatti.' : 'Copia completata e verificata. Gli originali su Supabase sono rimasti intatti.',
       });
     }
