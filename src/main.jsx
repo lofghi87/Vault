@@ -1359,7 +1359,6 @@ function App() {
       <section className="stats">
         <div className="stat-card"><div className="stat-icon"><Film size={18}/></div><div><strong>{videos.length}</strong><span>Video archiviati</span></div></div>
         <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? 2_000_000_000)}</strong><span>Spazio Backblaze utilizzato</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><Activity size={18}/></div><div><strong>{storageQuota ? formatSize(storageQuota.bucketUsedBytes || 0) : '—'}</strong><span>Spazio totale Backblaze · tutti i file</span></div></div>
         <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{googleDriveQuota?.limitBytes == null && googleDriveQuota ? 'Senza limite' : googleDriveQuota?.availableBytes != null ? formatSize(googleDriveQuota.availableBytes) : googleAccounts.length ? 'Aggiorna Google' : 'Non collegato'}</strong><span>Spazio disponibile su Google Drive</span></div></div>
       </section>
 
