@@ -92,25 +92,32 @@ export default async function handler(req, res) {
     if (action === 'list') {
       const prefix = userId + '/';
       const result = await s3.send(new ListObjectsV2Command({
-        Bucket: bucket, Prefix: prefix, Delimiter: '/', MaxKeys: 1000,
+        Bucket: bucket,
+        Prefix: prefix,
+        MaxKeys: 1000,
+        ...(typeof body.continuationToken === 'string' && body.continuationToken
+          ? { ContinuationToken: body.continuationToken }
+          : {}),
       }));
       const items = (result.Contents || [])
-        .filter(item => item.Key && item.Key !== prefix)
+        .filter(item => item.Key && item.Key.startsWith(prefix) && !item.Key.startsWith(prefix + '_shares/'))
         .map(item => {
-          const name = item.Key.slice(prefix.length);
-          if (!name || name.includes('/')) return null;
+          const path = item.Key;
+          const name = path.slice(path.lastIndexOf('/') + 1);
+          if (!name) return null;
           return {
             name,
-            id: item.ETag || item.Key,
+            path,
+            id: item.ETag || path,
             created_at: item.LastModified?.toISOString?.() || new Date().toISOString(),
             updated_at: item.LastModified?.toISOString?.() || new Date().toISOString(),
             metadata: { size: item.Size || 0, mimetype: 'application/octet-stream' },
           };
         }).filter(Boolean);
-      items.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-      const offset = Math.max(0, Number(body.offset) || 0);
-      const limit = Math.min(1000, Math.max(1, Number(body.limit) || 100));
-      return send(res, 200, { data: items.slice(offset, offset + limit) });
+      return send(res, 200, {
+        data: items,
+        nextContinuationToken: result.IsTruncated ? (result.NextContinuationToken || null) : null,
+      });
     }
 
     if (action === 'migrate') {
