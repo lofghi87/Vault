@@ -145,13 +145,17 @@ export default async function handler(req, res) {
       const response = await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId) + '?fields=id,name,size,createdTime,parents');
       const file = await response.json().catch(() => ({}));
       if (!response.ok || !file.id) return send(res, 404, { error: 'Non riesco a verificare il video su Google Drive.' });
-      const expectedSize = Number(req.body.expectedSize || 0);
-      if (expectedSize && Number(file.size || 0) !== expectedSize) {
-        await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId), { method: 'DELETE' });
-        return send(res, 422, { error: 'La verifica dimensionale del video su Google Drive non è riuscita. Il file incompleto è stato rimosso.' });
-      }
+      // Verifica proprietà e cartella prima di qualsiasi azione che possa eliminare un file.
       if (!(file.parents || []).includes(account.folder_id) || !file.name?.endsWith('.vlt')) {
         return send(res, 403, { error: 'Il file non appartiene alla cartella Vault prevista.' });
+      }
+      const expectedSize = Number(req.body.expectedSize || 0);
+      if (expectedSize && Number(file.size || 0) !== expectedSize) {
+        const deleteResponse = await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId), { method: 'DELETE' });
+        if (!deleteResponse.ok && deleteResponse.status !== 204) {
+          return send(res, 502, { error: 'La verifica dimensionale non è riuscita e Google non ha confermato la rimozione del file incompleto.' });
+        }
+        return send(res, 422, { error: 'La verifica dimensionale del video su Google Drive non è riuscita. Il file incompleto è stato rimosso.' });
       }
       return send(res, 200, { data: { id: file.id, name: file.name, size: Number(file.size || 0), created_at: file.createdTime } });
     }
