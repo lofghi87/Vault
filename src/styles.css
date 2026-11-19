@@ -209,7 +209,6 @@ button,input{min-width:0}
 @media(max-width:600px){.upload-destination-modal{padding:22px 18px}.upload-destination-option{padding:12px}}
 
 
-/* Quattro indicatori di spazio: layout leggibile anche su telefono */
-.stats{grid-template-columns:repeat(4,minmax(0,1fr))}
+/* Tre indicatori principali nella dashboard */
+.stats{grid-template-columns:repeat(3,minmax(0,1fr))}
 @media(max-width:850px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:650px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
