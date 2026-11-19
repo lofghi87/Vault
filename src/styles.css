@@ -209,6 +209,5 @@ button,input{min-width:0}
 @media(max-width:600px){.upload-destination-modal{padding:22px 18px}.upload-destination-option{padding:12px}}
 
 
-/* Tre indicatori principali nella dashboard */
+/* Tre indicatori principali sempre disposti su un'unica riga */
 .stats{grid-template-columns:repeat(3,minmax(0,1fr))}
-@media(max-width:850px){.stats{grid-template-columns:repeat(2,minmax(0,1fr))}}
