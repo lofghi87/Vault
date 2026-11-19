@@ -344,9 +344,32 @@ function App() {
     event.preventDefault();
     if (vaultPassphrase.length < 12) { setError('Usa una frase segreta di almeno 12 caratteri.'); return; }
     setUnlockBusy(true); setError('');
-    try { setVaultKey(await deriveVaultKey(vaultPassphrase, session.user.id)); setVaultPassphrase(''); await logActivity(session.user.id, 'vault_unlocked', null, 'Cassaforte sbloccata da questo dispositivo'); }
-    catch { setError('Non riesco a sbloccare la cassaforte.'); }
-    finally { setUnlockBusy(false); }
+    try {
+      const candidateKey = await deriveVaultKey(vaultPassphrase, session.user.id);
+      // Se esiste almeno un video cifrato, verifica la frase prima di sbloccare la libreria.
+      // Usa il file più piccolo per limitare il download necessario alla verifica.
+      const entries = await b2ListAll(session);
+      const sample = entries
+        .filter(item => item.name?.endsWith('.vlt'))
+        .sort((a, b) => (a.metadata?.size || 0) - (b.metadata?.size || 0))[0];
+      if (sample) {
+        const samplePath = sample.path || (session.user.id + '/' + sample.name);
+        const encryptedSample = await b2Download(session, samplePath);
+        await decryptVideo(encryptedSample, candidateKey, getOriginalVideoMime(sample.name));
+      }
+      setVaultKey(candidateKey);
+      setVaultPassphrase('');
+      await logActivity(session.user.id, 'vault_unlocked', null, 'Cassaforte sbloccata da questo dispositivo');
+    } catch (unlockError) {
+      setVaultPassphrase('');
+      if (unlockError?.name === 'OperationError') {
+        setError('Frase segreta errata. Inseriscila nuovamente per sbloccare Vault.');
+      } else {
+        setError('Non riesco a verificare la frase segreta. Controlla la connessione e riprova.');
+      }
+    } finally {
+      setUnlockBusy(false);
+    }
   }
 
   async function changeVaultPassphrase(event) {
