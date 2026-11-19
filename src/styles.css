@@ -176,3 +176,20 @@ button,input{min-width:0}
 }
 
 .storage-panel{margin:-18px 0 34px;padding:20px;background:linear-gradient(125deg,#15171a,#101215);border:1px solid #292d33;border-radius:15px}.storage-panel-head{display:flex;align-items:flex-start;justify-content:space-between;gap:18px}.storage-panel-head h2{margin:7px 0 5px;font:700 19px Manrope,sans-serif}.storage-panel-head p{margin:0;color:#9298a1;font-size:12px;line-height:1.5}.storage-connect-btn{width:auto;min-width:190px;flex-shrink:0}.storage-destination-row{display:flex;align-items:center;gap:18px;margin-top:20px;padding:13px 0;border-top:1px solid #292d33;border-bottom:1px solid #292d33}.storage-destination-row label{color:#c6c9ce;font-size:12px;font-weight:600}.storage-destination-row select{min-width:260px;max-width:100%;height:40px;padding:0 12px;border:1px solid #343941;border-radius:9px;background:#0d0f12;color:#f2f3f5;font:500 12px 'DM Sans',sans-serif;outline:none}.storage-destination-row select:focus{border-color:#9d7d49}.storage-account-list{display:grid;gap:9px;margin-top:12px}.storage-muted,.storage-note{margin:0;color:#858b95;font-size:11px;line-height:1.5}.storage-account-row{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:11px 12px;border:1px solid #292d33;border-radius:10px;background:#101215}.storage-account-copy{display:grid;gap:4px;min-width:0}.storage-account-copy b{font-size:12px;overflow-wrap:anywhere}.storage-account-copy span{color:#89909a;font-size:10px}.storage-account-copy .storage-account-error{color:#d9a18b}.storage-account-actions{display:flex;align-items:center;gap:8px;flex-shrink:0}.storage-account-actions button{padding:7px 10px;border:1px solid #383d45;border-radius:7px;background:#171a1f;color:#c8ccd2;font-size:10px}.storage-account-actions button:disabled{opacity:.5}.storage-error{display:flex;gap:8px;align-items:flex-start;margin-top:12px;padding:10px 12px;border-radius:8px;background:#241915;border:1px solid #55372e;color:#e0b3a3;font-size:11px;line-height:1.45}.storage-note{margin-top:12px}.video-source{display:flex;align-items:center;gap:5px;margin:-4px 0 10px;color:#9c8a69;font-size:9px;letter-spacing:.02em;overflow-wrap:anywhere}.video-source svg{flex-shrink:0}@media(max-width:700px){.storage-panel{margin:-14px 0 28px;padding:15px}.storage-panel-head{flex-direction:column;align-items:stretch}.storage-connect-btn{width:100%}.storage-destination-row{align-items:stretch;flex-direction:column;gap:8px}.storage-destination-row select{width:100%;min-width:0}.storage-account-row{align-items:flex-start;flex-direction:column}.storage-account-actions{width:100%;justify-content:flex-end}}
+
+
+/* Centralized settings hub */
+.settings-hub-modal{width:min(100%,520px)}
+.settings-menu-list{display:grid;gap:10px;margin-top:22px}
+.settings-menu-item{display:flex;align-items:center;gap:13px;width:100%;padding:15px;border:1px solid var(--line,rgba(255,255,255,.1));border-radius:15px;background:rgba(255,255,255,.035);color:inherit;text-align:left;cursor:pointer;transition:background .18s,border-color .18s,transform .18s}
+.settings-menu-item:hover{background:rgba(255,255,255,.075);border-color:rgba(255,255,255,.2);transform:translateY(-1px)}
+.settings-menu-item>span:nth-child(2){display:grid;gap:4px;flex:1;min-width:0}
+.settings-menu-item b{font-size:14px;font-weight:650}
+.settings-menu-item small{font-size:12px;line-height:1.4;color:var(--muted,#9da3ad)}
+.settings-menu-icon{display:grid;place-items:center;width:40px;height:40px;flex:0 0 40px;border-radius:12px;background:rgba(255,255,255,.07);color:var(--accent,#c9d5ff)}
+.settings-menu-item>svg:last-child{opacity:.55;flex:0 0 auto}
+.settings-detail-modal{width:min(100%,680px);max-height:min(88vh,850px);overflow-y:auto}
+.settings-detail-modal .storage-panel{margin:22px 0 0;padding:0;border:0;background:transparent;box-shadow:none}
+.settings-detail-modal .storage-panel-head{align-items:flex-start}
+.settings-gear-btn{position:relative}
+@media(max-width:600px){.settings-menu-item{padding:13px}.settings-menu-icon{width:36px;height:36px;flex-basis:36px}.settings-detail-modal{max-height:90vh}}
