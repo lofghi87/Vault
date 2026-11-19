@@ -24,6 +24,12 @@ async function b2ListAll(session) {
 async function b2Download(session,path){ const r=await b2Request(session,{action:'downloadUrl',path}); const response=await fetch(r.url); if(!response.ok) throw new Error('Download Backblaze non riuscito (HTTP '+response.status+').'); return response.blob(); }
 async function b2Upload(session,path,blob){ const r=await b2Request(session,{action:'uploadUrl',path}); const response=await fetch(r.url,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:blob}); if(!response.ok) throw new Error('Caricamento Backblaze non riuscito (HTTP '+response.status+').'); const v=await b2Request(session,{action:'verify',path}); if(Number(v.data?.size)!==blob.size) throw new Error('Verifica dimensionale Backblaze non riuscita.'); }
 async function b2Delete(session,paths){ if(paths?.length) await b2Request(session,{action:'delete',paths}); }
+async function b2DeleteShareCopies(session, paths) {
+  if (!paths?.length) return;
+  await b2Delete(session, paths);
+  const { error } = await supabase.storage.from(BUCKET).remove(paths);
+  if (error) throw new Error('Non riesco a rimuovere anche le eventuali vecchie copie su Supabase: ' + error.message);
+}
 async function b2Move(session,from,to){ await b2Request(session,{action:'move',from,to}); }
 async function b2Copy(session,from,to){ await b2Request(session,{action:'copy',from,to}); }
 async function b2SignedUrl(session,path,seconds=3600){ const r=await b2Request(session,{action:'sign',path,seconds}); return r.url; }
@@ -389,7 +395,7 @@ function App() {
       const { data: activeShares, error: activeSharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).is('revoked_at', null);
       if (activeSharesError) throw new Error('Non riesco a controllare i link temporanei: ' + activeSharesError.message);
       if (activeShares?.length) {
-        await b2Delete(session, activeShares.map(share => share.storage_path));
+        await b2DeleteShareCopies(session, activeShares.map(share => share.storage_path));
         const { error: markSharesError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', activeShares.map(share => share.id));
         if (markSharesError) console.warn('Copie dei link rimosse, ma alcuni record non sono stati aggiornati:', markSharesError.message);
       }
@@ -720,7 +726,7 @@ function App() {
     const { data: linkedShares, error: sharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).eq('original_path', item.path).is('revoked_at', null);
     if (sharesError) { setError('Non riesco a verificare i link attivi: ' + sharesError.message); return; }
     if (linkedShares?.length) {
-      try { await b2Delete(session, linkedShares.map(row => row.storage_path)); }
+      try { await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path)); }
       catch (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
       await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', linkedShares.map(row => row.id));
     }
@@ -759,7 +765,7 @@ function App() {
       const expiredPending = shareRows.filter(row => !row.revoked_at && new Date(row.expires_at).getTime() <= Date.now());
       if (expiredPending.length) {
         let cleanupError = null;
-        try { await b2Delete(session, expiredPending.map(row => row.storage_path)); } catch (e) { cleanupError = e; }
+        try { await b2DeleteShareCopies(session, expiredPending.map(row => row.storage_path)); } catch (e) { cleanupError = e; }
         if (!cleanupError) {
           const { error: markError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', expiredPending.map(row => row.id));
           if (!markError) shareRows = shareRows.map(row => expiredPending.some(expired => expired.id === row.id) ? { ...row, revoked_at: new Date().toISOString() } : row);
@@ -776,7 +782,7 @@ function App() {
 
   async function revokeShare(share) {
     if (!window.confirm('Revocare questo link? Vault rimuoverà la copia temporanea condivisa. Chi ha già scaricato il video o ne ha conservato una copia non può essere disconnesso da remoto.')) return;
-    try { await b2Delete(session, [share.storage_path]); }
+    try { await b2DeleteShareCopies(session, [share.storage_path]); }
     catch (removeError) { setError('Non riesco a rimuovere la copia condivisa: ' + removeError.message); return; }
     const { error: updateError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).eq('id', share.id).eq('user_id', session.user.id);
     if (updateError) setError('Copia condivisa rimossa, ma registro non aggiornato: ' + updateError.message);
