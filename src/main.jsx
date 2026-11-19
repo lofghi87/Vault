@@ -9,6 +9,25 @@ const supabaseKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
 const supabase = createClient(supabaseUrl, supabaseKey);
 const BUCKET = 'vault-videos';
 const SHARE_SECONDS = 60 * 60;
+async function b2Request(session, payload) {
+  if (!session?.access_token) throw new Error('Sessione non valida: accedi di nuovo.');
+  const response = await fetch('/api/storage', { method: 'POST', headers: { Authorization: 'Bearer ' + session.access_token, 'Content-Type': 'application/json' }, body: JSON.stringify(payload) });
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok) throw new Error(result.error || 'Operazione Backblaze non riuscita (HTTP ' + response.status + ').');
+  return result;
+}
+async function b2ListAll(session) {
+  const all=[];
+  for(let offset=0;;offset+=100){ const result=await b2Request(session,{action:'list',offset,limit:100}); const page=result.data||[]; all.push(...page); if(page.length<100) break; }
+  return all;
+}
+async function b2Download(session,path){ const r=await b2Request(session,{action:'downloadUrl',path}); const response=await fetch(r.url); if(!response.ok) throw new Error('Download Backblaze non riuscito (HTTP '+response.status+').'); return response.blob(); }
+async function b2Upload(session,path,blob){ const r=await b2Request(session,{action:'uploadUrl',path}); const response=await fetch(r.url,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:blob}); if(!response.ok) throw new Error('Caricamento Backblaze non riuscito (HTTP '+response.status+').'); const v=await b2Request(session,{action:'verify',path}); if(Number(v.data?.size)!==blob.size) throw new Error('Verifica dimensionale Backblaze non riuscita.'); }
+async function b2Delete(session,paths){ if(paths?.length) await b2Request(session,{action:'delete',paths}); }
+async function b2Move(session,from,to){ await b2Request(session,{action:'move',from,to}); }
+async function b2Copy(session,from,to){ await b2Request(session,{action:'copy',from,to}); }
+async function b2SignedUrl(session,path,seconds=3600){ const r=await b2Request(session,{action:'sign',path,seconds}); return r.url; }
+
 
 
 function getDisplayName(name) {
@@ -117,8 +136,9 @@ function parseIncomingShare() {
     if (!raw) return null;
     const payload = JSON.parse(raw);
     const signedUrl = new URL(payload.url);
-    const storageOrigin = new URL(supabaseUrl).origin;
-    if (signedUrl.origin !== storageOrigin || !signedUrl.pathname.includes('/storage/v1/object/sign/' + BUCKET + '/')) return null;
+    const isSupabaseShare = signedUrl.origin === new URL(supabaseUrl).origin && signedUrl.pathname.includes('/storage/v1/object/sign/' + BUCKET + '/');
+    const isBackblazeShare = signedUrl.hostname === 's3.eu-central-003.backblazeb2.com' && signedUrl.pathname.includes('/' + BUCKET + '/');
+    if (!isSupabaseShare && !isBackblazeShare) return null;
     if (!payload.key || !payload.name || !payload.mime || base64ToBytes(payload.key).length !== 32) return null;
     return payload;
   } catch { return null; }
@@ -253,17 +273,9 @@ function App() {
     if (!session?.user?.id || !vaultKey) return;
     setLoadingVideos(true);
     setError('');
-    const { data, error: listError } = await supabase.storage.from(BUCKET).list(session.user.id, {
-      limit: 100,
-      sortBy: { column: 'created_at', order: 'desc' }
-    });
-    if (listError) {
-      setError(listError.message);
-      setVideos([]);
-      setLoadingVideos(false);
-      return;
-    }
-    const entries = (data || []).filter(item => item.name && item.id);
+    let entries;
+    try { entries = await b2ListAll(session); }
+    catch (listError) { setError('Non riesco a caricare i video da Backblaze: ' + listError.message); setVideos([]); setLoadingVideos(false); return; }
     const { data: metadataRows, error: metadataError } = await supabase
       .from('vault_video_meta')
       .select('storage_path,folder_name')
@@ -275,7 +287,7 @@ function App() {
     }
     const folderByPath = new Map((metadataRows || []).map(row => [row.storage_path, row.folder_name]));
     const withUrls = entries.map(item => {
-      const path = session.user.id + '/' + item.name;
+      const path = item.path || (session.user.id + '/' + item.name);
       return { ...item, path, folder: folderByPath.get(path) || 'Generale', encrypted: item.name.endsWith('.vlt'), displayName: getDisplayName(item.name), size: item.metadata?.size || 0, mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || '') };
     });
     setVideos(withUrls);
@@ -377,8 +389,7 @@ function App() {
       const { data: activeShares, error: activeSharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).is('revoked_at', null);
       if (activeSharesError) throw new Error('Non riesco a controllare i link temporanei: ' + activeSharesError.message);
       if (activeShares?.length) {
-        const { error: removeSharesError } = await supabase.storage.from(BUCKET).remove(activeShares.map(share => share.storage_path));
-        if (removeSharesError) throw new Error('Non riesco a revocare i link temporanei: ' + removeSharesError.message);
+        await b2Delete(session, activeShares.map(share => share.storage_path));
         const { error: markSharesError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', activeShares.map(share => share.id));
         if (markSharesError) console.warn('Copie dei link rimosse, ma alcuni record non sono stati aggiornati:', markSharesError.message);
       }
@@ -386,13 +397,9 @@ function App() {
       const allItems = [];
       const pageSize = 100;
       for (let offset = 0; ; offset += pageSize) {
-        const { data, error: listError } = await supabase.storage.from(BUCKET).list(session.user.id, {
-          limit: pageSize, offset, sortBy: { column: 'created_at', order: 'asc' }
-        });
-        if (listError) throw listError;
-        const page = (data || []).filter(item => item.name && item.id);
+        const page = await b2ListAll(session);
         allItems.push(...page);
-        if (page.length < pageSize) break;
+        break;
       }
 
       if (!allItems.length) {
@@ -409,28 +416,22 @@ function App() {
           const displayName = getDisplayName(item.name);
           const mime = item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || 'video/mp4');
           setRotationProgress('Cifratura e verifica ' + (index + 1) + ' di ' + allItems.length + ': ' + displayName);
-          const { data, error: downloadError } = await supabase.storage.from(BUCKET).download(oldPath);
-          if (downloadError || !data) throw new Error('Download non riuscito per "' + displayName + '": ' + (downloadError?.message || 'file non disponibile'));
+          const data = await b2Download(session, oldPath);
           const plain = item.name.endsWith('.vlt') ? await decryptVideo(data, vaultKey, mime) : data;
           const encrypted = await encryptVideo(plain, newKey);
           // Verifica locale dell'integrità prima di caricare la nuova copia.
           await decryptVideo(encrypted, newKey, mime);
           const safeName = displayName.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
           const newPath = session.user.id + '/' + crypto.randomUUID() + '-' + safeName + '.vlt';
-          const { error: uploadError } = await supabase.storage.from(BUCKET).upload(newPath, encrypted, {
-            cacheControl: '0', contentType: 'application/octet-stream', upsert: false
-          });
-          if (uploadError) throw new Error('Caricamento della nuova copia non riuscito per "' + displayName + '": ' + uploadError.message);
+          await b2Upload(session, newPath, encrypted);
           stagedPaths.push(newPath);
           // Verifica anche la copia effettivamente salvata sul server.
-          const { data: savedCopy, error: verifyError } = await supabase.storage.from(BUCKET).download(newPath);
-          if (verifyError || !savedCopy) throw new Error('Verifica della nuova copia non riuscita per "' + displayName + '".');
+          const savedCopy = await b2Download(session, newPath);
           await decryptVideo(savedCopy, newKey, mime);
           oldPaths.push(oldPath);
         }
         setRotationProgress('Tutti i video sono verificati. Sostituzione degli originali…');
-        const { error: removeError } = await supabase.storage.from(BUCKET).remove(oldPaths);
-        if (removeError) throw new Error('Le nuove copie sono pronte, ma non sono riuscito a completare la sostituzione degli originali: ' + removeError.message);
+        await b2Delete(session, oldPaths);
         setVaultKey(newKey);
         setSettingsOpen(false);
         await logActivity(session.user.id, 'vault_passphrase_changed', null, 'Frase segreta aggiornata: video ricifrati e link temporanei revocati');
@@ -442,7 +443,7 @@ function App() {
       setVaultPassphrase('');
     } catch (e) {
       if (stagedPaths.length) {
-        await supabase.storage.from(BUCKET).remove(stagedPaths);
+        await b2Delete(session, stagedPaths);
       }
       setError('Modifica della frase non completata: ' + (e.message || 'errore sconosciuto') + ' I video originali sono stati mantenuti.');
     } finally {
@@ -532,8 +533,7 @@ function App() {
       const path = session.user.id + '/' + crypto.randomUUID() + '-' + safeName + '.vlt';
       try {
         const encrypted = await encryptVideo(file, vaultKey);
-        const { error: uploadError } = await supabase.storage.from(BUCKET).upload(path, encrypted, { cacheControl: '0', contentType: 'application/octet-stream', upsert: false });
-        if (uploadError) throw uploadError;
+        await b2Upload(session, path, encrypted);
         const { error: metaError } = await supabase.from('vault_video_meta').upsert(
           { user_id: session.user.id, storage_path: path, folder_name: 'Generale', updated_at: new Date().toISOString() },
           { onConflict: 'user_id,storage_path' }
@@ -555,10 +555,9 @@ function App() {
     setOpeningVideoId(item.id);
     setError('');
     try {
-      const result = await supabase.storage.from(BUCKET).download(item.path);
-      if (result.error) throw new Error('Download non riuscito: ' + result.error.message);
-      if (!result.data || typeof result.data.arrayBuffer !== 'function') throw new Error('Supabase non ha restituito un file valido.');
-      const decrypted = await decryptVideo(result.data, vaultKey, item.mime);
+      const encryptedBlob = await b2Download(session, item.path);
+      if (!encryptedBlob || typeof encryptedBlob.arrayBuffer !== 'function') throw new Error('Backblaze non ha restituito un file valido.');
+      const decrypted = await decryptVideo(encryptedBlob, vaultKey, item.mime);
       createVideoPoster(decrypted).then(poster => { if (poster) setThumbnails(current => ({ ...current, [item.path]: poster })); }).catch(() => {});
       await logActivity(session.user.id, 'video_opened', item.displayName || getDisplayName(item.name), 'Video aperto nella libreria privata');
       if (previewUrl) URL.revokeObjectURL(previewUrl);
@@ -593,9 +592,9 @@ function App() {
     const newName = crypto.randomUUID() + '-' + clean + extension + '.vlt';
     const newPath = session.user.id + '/' + newName;
     setRenameBusy(true); setError('');
-    const { error: moveError } = await supabase.storage.from(BUCKET).move(renameItem.path, newPath);
+    try { await b2Move(session, renameItem.path, newPath); }
+    catch (moveError) { setRenameBusy(false); setError('Non sono riuscito a rinominare il video: ' + moveError.message); return; }
     setRenameBusy(false);
-    if (moveError) { setError('Non sono riuscito a rinominare il video: ' + moveError.message); return; }
     const { error: metaError } = await supabase.from('vault_video_meta').update({ storage_path: newPath, updated_at: new Date().toISOString() }).eq('user_id', session.user.id).eq('storage_path', renameItem.path);
     if (metaError) setError('Video rinominato, ma cartella non aggiornata: ' + metaError.message);
     const { error: sharesMoveError } = await supabase.from('vault_shares').update({ original_path: newPath, file_name: clean + extension }).eq('user_id', session.user.id).eq('original_path', renameItem.path).is('revoked_at', null);
@@ -633,18 +632,16 @@ function App() {
       const shareId = crypto.randomUUID();
       const safeName = (shareItem.displayName || getDisplayName(shareItem.name)).normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-90) || 'video';
       sharePath = session.user.id + '/_shares/' + shareId + '/' + safeName + (shareItem.encrypted ? '.vlt' : '');
-      const { error: copyError } = await supabase.storage.from(BUCKET).copy(shareItem.path, sharePath);
-      if (copyError) throw copyError;
+      await b2Copy(session, shareItem.path, sharePath);
       const expiresAt = new Date(Date.now() + SHARE_SECONDS * 1000).toISOString();
-      const { data, error: signError } = await supabase.storage.from(BUCKET).createSignedUrl(sharePath, SHARE_SECONDS, { download: false });
-      if (signError) throw signError;
+      const signedUrl = await b2SignedUrl(session, sharePath, SHARE_SECONDS);
       const { data: shareRecord, error: recordError } = await supabase.from('vault_shares').insert({
         user_id: session.user.id, original_path: shareItem.path, storage_path: sharePath,
         file_name: shareItem.displayName || getDisplayName(shareItem.name), expires_at: expiresAt
       }).select('id').single();
       if (recordError) throw recordError;
       shareRecordId = shareRecord?.id || '';
-      let url = data.signedUrl;
+      let url = signedUrl;
       if (shareItem.encrypted) {
         if (!vaultKey) throw new Error('Sblocca nuovamente Vault per creare il link.');
         const rawKey = await crypto.subtle.exportKey('raw', vaultKey);
@@ -661,7 +658,7 @@ function App() {
       await loadSecurityData();
     } catch (e) {
       if (shareRecordId) await supabase.from('vault_shares').delete().eq('id', shareRecordId).eq('user_id', session.user.id);
-      if (sharePath) await supabase.storage.from(BUCKET).remove([sharePath]);
+      if (sharePath) await b2Delete(session, [sharePath]);
       setError('Non sono riuscito a creare il link: ' + (e.message || 'errore sconosciuto'));
     } finally {
       setShareBusy(false);
@@ -673,8 +670,7 @@ function App() {
     setShareBusy(true);
     setError('');
     try {
-      const { data, error: downloadError } = await supabase.storage.from(BUCKET).download(shareItem.path);
-      if (downloadError) throw downloadError;
+      const data = await b2Download(session, shareItem.path);
       const content = shareItem.encrypted ? await decryptVideo(data, vaultKey, shareItem.mime) : data;
       const filename = shareItem.displayName || getDisplayName(shareItem.name);
       setCopyFile(new File([content], filename, { type: shareItem.mime || content.type || 'video/mp4' }));
@@ -724,13 +720,13 @@ function App() {
     const { data: linkedShares, error: sharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).eq('original_path', item.path).is('revoked_at', null);
     if (sharesError) { setError('Non riesco a verificare i link attivi: ' + sharesError.message); return; }
     if (linkedShares?.length) {
-      const { error: shareDeleteError } = await supabase.storage.from(BUCKET).remove(linkedShares.map(row => row.storage_path));
-      if (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
+      try { await b2Delete(session, linkedShares.map(row => row.storage_path)); }
+      catch (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
       await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', linkedShares.map(row => row.id));
     }
-    const { error: deleteError } = await supabase.storage.from(BUCKET).remove([item.path]);
-    if (deleteError) setError(deleteError.message);
-    else {
+    try { await b2Delete(session, [item.path]); }
+    catch (deleteError) { setError(deleteError.message); return; }
+    {
       await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', item.path);
       await logActivity(session.user.id, 'video_deleted', item.displayName || getDisplayName(item.name), 'Video eliminato dalla libreria');
       setVideos(current => current.filter(v => v.id !== item.id));
@@ -762,7 +758,8 @@ function App() {
       let shareRows = shareResult.data || [];
       const expiredPending = shareRows.filter(row => !row.revoked_at && new Date(row.expires_at).getTime() <= Date.now());
       if (expiredPending.length) {
-        const { error: cleanupError } = await supabase.storage.from(BUCKET).remove(expiredPending.map(row => row.storage_path));
+        let cleanupError = null;
+        try { await b2Delete(session, expiredPending.map(row => row.storage_path)); } catch (e) { cleanupError = e; }
         if (!cleanupError) {
           const { error: markError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', expiredPending.map(row => row.id));
           if (!markError) shareRows = shareRows.map(row => expiredPending.some(expired => expired.id === row.id) ? { ...row, revoked_at: new Date().toISOString() } : row);
@@ -779,8 +776,8 @@ function App() {
 
   async function revokeShare(share) {
     if (!window.confirm('Revocare questo link? Vault rimuoverà la copia temporanea condivisa. Chi ha già scaricato il video o ne ha conservato una copia non può essere disconnesso da remoto.')) return;
-    const { error: removeError } = await supabase.storage.from(BUCKET).remove([share.storage_path]);
-    if (removeError) { setError('Non riesco a rimuovere la copia condivisa: ' + removeError.message); return; }
+    try { await b2Delete(session, [share.storage_path]); }
+    catch (removeError) { setError('Non riesco a rimuovere la copia condivisa: ' + removeError.message); return; }
     const { error: updateError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).eq('id', share.id).eq('user_id', session.user.id);
     if (updateError) setError('Copia condivisa rimossa, ma registro non aggiornato: ' + updateError.message);
     await logActivity(session.user.id, 'share_revoked', share.file_name, 'Link temporaneo revocato e copia condivisa rimossa');
