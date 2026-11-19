@@ -163,9 +163,6 @@ function App() {
   const [videos, setVideos] = useState([]);
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [uploading, setUploading] = useState(false);
-  const [migrating, setMigrating] = useState(false);
-  const [migrationProgress, setMigrationProgress] = useState('');
-  const migrationStarted = useRef(false);
   const [progressName, setProgressName] = useState('');
   const [shareItem, setShareItem] = useState(null);
   const [shareUrl, setShareUrl] = useState('');
@@ -299,16 +296,6 @@ function App() {
     setVideos(withUrls);
     setLoadingVideos(false);
   }, [session, vaultKey]);
-
-  useEffect(() => {
-    if (!session) {
-      migrationStarted.current = false;
-      return;
-    }
-    if (!vaultKey || migrationStarted.current) return;
-    migrationStarted.current = true;
-    migrateVideosToBackblaze();
-  }, [session?.access_token, vaultKey]);
 
   useEffect(() => {
     if (session && vaultKey) loadVideos();
@@ -467,73 +454,6 @@ function App() {
     setShareUrl('');
   }
 
-  async function migrateVideosToBackblaze() {
-    if (!session?.access_token || migrating) return;
-    setMigrating(true);
-    setMigrationProgress('Copia sicura dal server a Backblaze…');
-    setError('');
-    try {
-      const response = await fetch('/api/storage', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + session.access_token,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ action: 'migrate' }),
-      });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok && response.status !== 207) {
-        throw new Error(result.error || 'Migrazione non riuscita (HTTP ' + response.status + ').');
-      }
-      const data = result.data || {};
-      const copied = Array.isArray(data.copied) ? data.copied : [];
-      const skipped = Array.isArray(data.skipped) ? data.skipped : [];
-      const failures = Array.isArray(data.failures) ? data.failures : [];
-      if (failures.length) {
-        const first = failures[0];
-        throw new Error('Copiati: ' + copied.length + ', già presenti: ' + skipped.length + '. Problema con ' + (first.name || 'un file') + ': ' + (first.error || 'errore sconosciuto') + '. Gli originali su Supabase sono rimasti intatti.');
-      }
-      setMigrationProgress('Controllo integrità SHA-256 di ogni video…');
-      const verifyResponse = await fetch('/api/storage', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + session.access_token,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ action: 'verifyMigration' }),
-      });
-      const verification = await verifyResponse.json().catch(() => ({}));
-      if (!verifyResponse.ok && verifyResponse.status !== 207) {
-        throw new Error(verification.error || 'Verifica integrità non riuscita (HTTP ' + verifyResponse.status + ').');
-      }
-      const verificationSummary = verification.summary || {};
-      if (verificationSummary.failures || verificationSummary.verified !== verificationSummary.scanned) {
-        const first = verification.data?.failures?.[0];
-        throw new Error('Verificati con SHA-256: ' + (verificationSummary.verified || 0) + '/' + (verificationSummary.scanned || 0) + '. ' + (first?.name ? first.name + ': ' : '') + (first?.error || 'almeno un file non è stato verificato') + '. Gli originali su Supabase sono rimasti intatti.');
-      }
-      setMigrationProgress('Verifica finale e rimozione degli originali da Supabase…');
-      const cleanupResponse = await fetch('/api/storage', {
-        method: 'POST',
-        headers: {
-          Authorization: 'Bearer ' + session.access_token,
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({ action: 'purgeSupabaseVerified' }),
-      });
-      const cleanup = await cleanupResponse.json().catch(() => ({}));
-      if (!cleanupResponse.ok) {
-        throw new Error(cleanup.error || 'Pulizia Supabase non riuscita (HTTP ' + cleanupResponse.status + ').');
-      }
-      const removed = cleanup.summary?.removed || 0;
-      setMessage('Completato: ' + verificationSummary.verified + ' video verificati con SHA-256 e ' + removed + ' originali rimossi da Supabase. Backblaze è ora l’archivio dei video.');
-      await logActivity(session.user.id, 'other', null, 'Backblaze verificato con SHA-256; rimossi ' + removed + ' originali Supabase');
-    } catch (e) {
-      setError('Backup su Backblaze non completato: ' + (e.message || 'errore sconosciuto') + ' Nessun originale su Supabase è stato eliminato.');
-    } finally {
-      setMigrating(false);
-      setMigrationProgress('');
-    }
-  }
 
   async function handleUpload(event) {
     const selected = Array.from(event.target.files || []);
@@ -997,7 +917,7 @@ function App() {
         <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(totalBytes)}</strong><span>Spazio utilizzato</span></div></div>
         <div className="stat-card"><div className="stat-icon"><ShieldCheck size={18}/></div><div><strong>Privato</strong><span>Accesso personale</span></div></div>
       </section>
-      {migrating && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Backup su Backblaze</b><span>{migrationProgress}</span></div></div>}
+
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
       {error && <div className="notice error dashboard-notice"><AlertCircle size={16}/>{error}<button onClick={() => setError('')}><X size={15}/></button></div>}
       <section className="library">
