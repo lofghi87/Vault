@@ -70,8 +70,15 @@ export default async function handler(req, res) {
 
     if (action === 'verify') {
       const key = safeKey(body.path, userId);
-      const result = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-      return send(res, 200, { data: { size: result.ContentLength || 0, etag: result.ETag || null } });
+      try {
+        const result = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+        return send(res, 200, { data: { size: result.ContentLength || 0, etag: result.ETag || null } });
+      } catch (error) {
+        if (error?.name === 'NotFound' || error?.name === 'NoSuchKey' || error?.$metadata?.httpStatusCode === 404) {
+          return send(res, 404, { error: 'File non presente su Backblaze.' });
+        }
+        throw error;
+      }
     }
 
     if (action === 'uploadUrl') {
