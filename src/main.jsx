@@ -484,11 +484,11 @@ function App() {
 
     let driveRows = [];
     let connectedAccounts = [];
+    let driveQuotaResult = null;
     try {
       const accountsResult = await googleRequest(session, { action: 'accounts' });
       connectedAccounts = accountsResult.data || [];
       setGoogleDriveError('');
-      let driveQuotaResult = null;
       for (const account of connectedAccounts) {
         try {
           const listResult = await googleRequest(session, { action: 'list', accountId: account.id });
