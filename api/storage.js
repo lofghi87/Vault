@@ -68,6 +68,12 @@ export default async function handler(req, res) {
       return send(res, 200, { data: items.slice(offset, offset + limit) });
     }
 
+    if (action === 'verify') {
+      const key = safeKey(body.path, userId);
+      const result = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+      return send(res, 200, { data: { size: result.ContentLength || 0, etag: result.ETag || null } });
+    }
+
     if (action === 'uploadUrl') {
       const key = safeKey(body.path, userId);
       const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: 'application/octet-stream', CacheControl: 'no-store' });
