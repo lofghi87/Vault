@@ -735,8 +735,7 @@ function App() {
 
   async function protectExistingVideoNames() {
     if (!session?.user?.id || !vaultKey || metadataMigrationBusy || rotationBusy) return;
-    const legacyPattern = /^[0-9a-f]{8}-[0-9a-f-]{27,}\\.[a-z0-9]+$/i;
-    const candidates = videos.filter(item => item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\\.vlt$/i.test(item.name || ''));
+    const candidates = videos.filter(item => item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\.vlt$/i.test(item.name || ''));
     if (!candidates.length) {
       setMetadataMigrationProgress('Non risultano nomi legacy da proteggere nella libreria caricata.');
       return;
