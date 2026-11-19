@@ -541,6 +541,7 @@ function App() {
     setError('');
     const stagedItems = [];
     let replacementStarted = false;
+    let pendingNewKey = null;
     try {
       setRotationProgress('Revoca dei link temporanei…');
       const { data: activeShares, error: activeSharesError } = await supabase
@@ -559,6 +560,7 @@ function App() {
       }
 
       const newKey = await deriveVaultKey(newVaultPassphrase, session.user.id);
+      pendingNewKey = newKey;
       const allItems = [];
       const b2Entries = await b2ListAll(session);
       for (const item of b2Entries) {
@@ -614,7 +616,7 @@ function App() {
           if (item.provider === 'google') {
             const saved = await googleUpload(session, item.accountId, newName, encrypted);
             stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id });
-            const savedCopy = await googleDownload(session, item.accountId, saved.id);
+            const savedCopy = await googleDownload(session, item.accountId, saved.id, saved.size);
             await decryptVideo(savedCopy, newKey, item.mime);
           } else {
             const newPath = session.user.id + '/' + newName;
@@ -660,8 +662,18 @@ function App() {
           }
         }
       }
+      if (replacementStarted && pendingNewKey) {
+        // Tutte le nuove copie sono state verificate prima di iniziare a rimuovere gli originali.
+        // Attivare la nuova chiave mantiene accessibile l'archivio anche se una vecchia copia non è stata eliminata.
+        setVaultKey(pendingNewKey);
+        setSettingsOpen(false);
+        setNewVaultPassphrase('');
+        setNewVaultPassphraseConfirm('');
+        setVaultPassphrase('');
+        setMessage('La nuova frase segreta è attiva e tutte le nuove copie sono state verificate. Alcune vecchie copie potrebbero essere ancora presenti: controlla lo spazio e la libreria.');
+      }
       const recoveryNote = replacementStarted
-        ? ' Le nuove copie verificate sono state conservate per sicurezza: controlla la libreria prima di ripetere la procedura.'
+        ? ' La nuova frase è attiva sulle copie verificate; controlla se sono rimaste vecchie copie da eliminare.'
         : ' I video originali sono stati mantenuti.';
       setError('Modifica della frase non completata: ' + (e.message || 'errore sconosciuto') + recoveryNote);
     } finally {
