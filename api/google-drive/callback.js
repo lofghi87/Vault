@@ -1,7 +1,7 @@
 import {
   googleConfigReady, getAdmin, redirectUri, appUrl, hashHex,
   encryptRefreshToken, userFromCallbackState, googleApi, createVaultDriveFolder,
-} from '../_google-drive.js';
+} from '../../lib/google-drive.js';
 
 function redirect(res, query) {
   res.status(302).setHeader('Location', appUrl() + '/?' + new URLSearchParams(query).toString());
