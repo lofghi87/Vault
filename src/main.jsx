@@ -110,7 +110,7 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
       throw new Error('Non riesco a riprendere il caricamento su Google Drive.');
     }
     const range = response.headers.get('Range') || '';
-    const match = range.match(/^bytes=0-(\\d+)$/);
+    const match = range.match(/^bytes=0-([0-9]+)$/);
     return { nextOffset: match ? Number(match[1]) + 1 : 0, uploaded: null };
   };
 
@@ -157,7 +157,7 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
     }
 
     const range = response.headers.get('Range') || '';
-    const match = range.match(/^bytes=0-(\\d+)$/);
+    const match = range.match(/^bytes=0-([0-9]+)$/);
     if (match) {
       offset = Number(match[1]) + 1;
     } else {
