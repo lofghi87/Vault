@@ -680,8 +680,10 @@ function App() {
     setOpeningVideoId(item.id);
     setError('');
     try {
-      const encryptedBlob = await b2Download(session, item.path);
-      if (!encryptedBlob || typeof encryptedBlob.arrayBuffer !== 'function') throw new Error('Backblaze non ha restituito un file valido.');
+      const encryptedBlob = item.provider === 'google'
+        ? await googleDownload(session, item.accountId, item.fileId)
+        : await b2Download(session, item.path);
+      if (!encryptedBlob || typeof encryptedBlob.arrayBuffer !== 'function') throw new Error('Lo spazio di archiviazione non ha restituito un file valido.');
       const decrypted = await decryptVideo(encryptedBlob, vaultKey, item.mime);
       createVideoPoster(decrypted).then(poster => { if (poster) setThumbnails(current => ({ ...current, [item.path]: poster })); }).catch(() => {});
       await logActivity(session.user.id, 'video_opened', item.displayName || getDisplayName(item.name), 'Video aperto nella libreria privata');
@@ -715,10 +717,19 @@ function App() {
     const extMatch = oldDisplay.match(/(\.[^.]+)$/);
     const extension = extMatch ? extMatch[1] : '';
     const newName = crypto.randomUUID() + '-' + clean + extension + '.vlt';
-    const newPath = session.user.id + '/' + newName;
+    const newPath = renameItem.provider === 'google' ? renameItem.path : session.user.id + '/' + newName;
     setRenameBusy(true); setError('');
-    try { await b2Move(session, renameItem.path, newPath); }
-    catch (moveError) { setRenameBusy(false); setError('Non sono riuscito a rinominare il video: ' + moveError.message); return; }
+    try {
+      if (renameItem.provider === 'google') {
+        await googleRequest(session, { action: 'rename', accountId: renameItem.accountId, fileId: renameItem.fileId, name: newName });
+      } else {
+        await b2Move(session, renameItem.path, newPath);
+      }
+    } catch (moveError) {
+      setRenameBusy(false);
+      setError('Non sono riuscito a rinominare il video: ' + moveError.message);
+      return;
+    }
     setRenameBusy(false);
     const { error: sharesMoveError } = await supabase.from('vault_shares').update({ original_path: newPath, file_name: clean + extension }).eq('user_id', session.user.id).eq('original_path', renameItem.path).is('revoked_at', null);
     if (sharesMoveError) setError('Video rinominato, ma non ho aggiornato il collegamento dei link già creati: ' + sharesMoveError.message);
@@ -755,7 +766,12 @@ function App() {
       const shareId = crypto.randomUUID();
       const safeName = (shareItem.displayName || getDisplayName(shareItem.name)).normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-90) || 'video';
       sharePath = session.user.id + '/_shares/' + shareId + '/' + safeName + (shareItem.encrypted ? '.vlt' : '');
-      await b2Copy(session, shareItem.path, sharePath);
+      if (shareItem.provider === 'google') {
+        const encryptedSource = await googleDownload(session, shareItem.accountId, shareItem.fileId);
+        await b2Upload(session, sharePath, encryptedSource);
+      } else {
+        await b2Copy(session, shareItem.path, sharePath);
+      }
       const expiresAt = new Date(Date.now() + SHARE_SECONDS * 1000).toISOString();
       const signedUrl = await b2SignedUrl(session, sharePath, SHARE_SECONDS);
       const { data: shareRecord, error: recordError } = await supabase.from('vault_shares').insert({
@@ -794,7 +810,9 @@ function App() {
     setShareBusy(true);
     setError('');
     try {
-      const data = await b2Download(session, shareItem.path);
+      const data = shareItem.provider === 'google'
+        ? await googleDownload(session, shareItem.accountId, shareItem.fileId)
+        : await b2Download(session, shareItem.path);
       const content = shareItem.encrypted ? await decryptVideo(data, vaultKey, shareItem.mime) : data;
       const filename = shareItem.displayName || getDisplayName(shareItem.name);
       setCopyFile(new File([content], filename, { type: shareItem.mime || content.type || 'video/mp4' }));
@@ -848,8 +866,13 @@ function App() {
       catch (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
       await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', linkedShares.map(row => row.id));
     }
-    try { await b2Delete(session, [item.path]); }
-    catch (deleteError) { setError(deleteError.message); return; }
+    try {
+      if (item.provider === 'google') {
+        await googleRequest(session, { action: 'delete', accountId: item.accountId, fileId: item.fileId });
+      } else {
+        await b2Delete(session, [item.path]);
+      }
+    } catch (deleteError) { setError(deleteError.message); return; }
     {
       await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', item.path);
       await logActivity(session.user.id, 'video_deleted', item.displayName || getDisplayName(item.name), 'Video eliminato dalla libreria');
