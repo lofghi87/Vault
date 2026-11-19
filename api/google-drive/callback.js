@@ -39,7 +39,20 @@ export default async function handler(req, res) {
       }),
     });
     const tokens = await tokenResponse.json().catch(() => ({}));
-    if (!tokenResponse.ok || !tokens.access_token) throw new Error('Google non ha completato l’autorizzazione. Riprova a collegare l’account.');
+    if (!tokenResponse.ok || !tokens.access_token) {
+      // Log only Google's non-secret error metadata; never log auth codes or tokens.
+      console.error('[Vault Google Drive token exchange]', {
+        status: tokenResponse.status,
+        error: tokens.error || 'unknown_error',
+        error_description: tokens.error_description || '',
+      });
+      const reason = tokens.error === 'invalid_client'
+        ? 'Le credenziali OAuth non corrispondono: controlla Client ID e Client Secret dello stesso client Google.'
+        : tokens.error === 'invalid_grant'
+          ? 'Il codice OAuth è scaduto o non corrisponde alla richiesta. Riprova il collegamento.'
+          : 'Google non ha completato lo scambio del codice di autorizzazione. Riprova.';
+      throw new Error(reason);
+    }
 
     const profileResponse = await googleApi(tokens.access_token, 'https://www.googleapis.com/oauth2/v3/userinfo'.replace('https://www.googleapis.com', ''));
     const profile = await profileResponse.json().catch(() => ({}));
