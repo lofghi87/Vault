@@ -23,19 +23,30 @@ export default async function handler(req, res) {
       const account = await getGoogleAccount(admin, user.id, String(req.query.accountId || ''));
       const fileId = String(req.query.fileId || '');
       if (!fileId || fileId.includes('/')) return send(res, 400, { error: 'File Google Drive non valido.' });
+      const rangeHeader = req.headers.range;
+      if (rangeHeader && !/^bytes=\\d+-\\d+$/.test(rangeHeader)) {
+        return send(res, 416, { error: 'Intervallo di download non valido.' });
+      }
       const accessToken = await getGoogleAccessToken(admin, account);
       const metadataResponse = await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId) + '?fields=id,parents');
       const metadata = await metadataResponse.json().catch(() => ({}));
       if (!metadataResponse.ok || !(metadata.parents || []).includes(account.folder_id)) {
         return send(res, 404, { error: 'Video non trovato nella cartella Vault di questo account.' });
       }
-      const driveResponse = await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media');
+      const driveResponse = await googleApi(
+        accessToken,
+        '/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media',
+        { headers: rangeHeader ? { Range: rangeHeader } : {} }
+      );
       if (!driveResponse.ok || !driveResponse.body) return send(res, driveResponse.status || 502, { error: 'Non riesco a scaricare il video cifrato da Google Drive.' });
-      res.status(200);
+      res.status(driveResponse.status === 206 ? 206 : 200);
       res.setHeader('Content-Type', 'application/octet-stream');
       res.setHeader('Cache-Control', 'private, no-store, max-age=0');
+      res.setHeader('Accept-Ranges', 'bytes');
       const length = driveResponse.headers.get('content-length');
+      const contentRange = driveResponse.headers.get('content-range');
       if (length) res.setHeader('Content-Length', length);
+      if (contentRange) res.setHeader('Content-Range', contentRange);
       Readable.fromWeb(driveResponse.body).pipe(res);
       return;
     }
