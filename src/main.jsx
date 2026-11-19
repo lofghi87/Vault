@@ -511,8 +511,22 @@ function App() {
         const first = verification.data?.failures?.[0];
         throw new Error('Verificati con SHA-256: ' + (verificationSummary.verified || 0) + '/' + (verificationSummary.scanned || 0) + '. ' + (first?.name ? first.name + ': ' : '') + (first?.error || 'almeno un file non è stato verificato') + '. Gli originali su Supabase sono rimasti intatti.');
       }
-      setMessage('Backup integro: ' + verificationSummary.verified + ' video verificati byte per byte (SHA-256). ' + copied.length + ' copiati ora, ' + skipped.length + ' già presenti su Backblaze. Gli originali su Supabase sono rimasti intatti.');
-      await logActivity(session.user.id, 'other', null, 'Backup Backblaze verificato con SHA-256: ' + verificationSummary.verified + ' file');
+      setMigrationProgress('Verifica finale e rimozione degli originali da Supabase…');
+      const cleanupResponse = await fetch('/api/storage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + session.access_token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'purgeSupabaseVerified' }),
+      });
+      const cleanup = await cleanupResponse.json().catch(() => ({}));
+      if (!cleanupResponse.ok) {
+        throw new Error(cleanup.error || 'Pulizia Supabase non riuscita (HTTP ' + cleanupResponse.status + ').');
+      }
+      const removed = cleanup.summary?.removed || 0;
+      setMessage('Completato: ' + verificationSummary.verified + ' video verificati con SHA-256 e ' + removed + ' originali rimossi da Supabase. Backblaze è ora l’archivio dei video.');
+      await logActivity(session.user.id, 'other', null, 'Backblaze verificato con SHA-256; rimossi ' + removed + ' originali Supabase');
     } catch (e) {
       setError('Backup su Backblaze non completato: ' + (e.message || 'errore sconosciuto') + ' Nessun originale su Supabase è stato eliminato.');
     } finally {
