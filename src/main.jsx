@@ -607,6 +607,7 @@ function App() {
       setShareUrl(url);
       await logActivity(session.user.id, 'share_created', shareItem.displayName || getDisplayName(shareItem.name), 'Creato link temporaneo con copia separata revocabile');
       await loadSecurityData();
+      await loadVideos();
     } catch (e) {
       if (shareRecordId) await supabase.from('vault_shares').delete().eq('id', shareRecordId).eq('user_id', session.user.id);
       if (sharePath) await b2Delete(session, [sharePath]);
