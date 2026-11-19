@@ -2,7 +2,7 @@ import { Readable } from 'node:stream';
 import {
   googleConfigReady, requireUser, getGoogleAccount, getGoogleAccessToken,
   decryptRefreshToken, googleApi, startGoogleOAuth, listGoogleFiles,
-} from './_google-drive.js';
+} from '../lib/google-drive.js';
 
 function send(res, status, body) {
   res.status(status).json(body);
