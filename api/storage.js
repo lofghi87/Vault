@@ -20,8 +20,8 @@ function send(res, status, body) {
   res.status(status).json(body);
 }
 
-const PERSONAL_QUOTA_BYTES = 2 * 1024 * 1024 * 1024;
-const GLOBAL_SAFE_LIMIT_BYTES = 8 * 1024 * 1024 * 1024;
+const PERSONAL_QUOTA_BYTES = 2_000_000_000;
+const GLOBAL_SAFE_LIMIT_BYTES = 8_000_000_000;
 
 // Counts all current objects, including temporary share copies, across the bucket.
 async function getBucketUsage(userId) {
