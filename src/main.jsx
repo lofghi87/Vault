@@ -996,7 +996,7 @@ function App() {
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
           const drivePath = 'google:' + googleAccountId + ':' + saved.id;
-          await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
+          await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), { name: file.name, mime: file.type || getOriginalVideoMime(file.name) }, vaultKey);
           uploadedDriveItems.push({
             id: 'google-' + googleAccountId + '-' + saved.id,
             fileId: saved.id,
@@ -1012,7 +1012,7 @@ function App() {
             provider: 'google',
             providerLabel: 'Google Drive · ' + googleAccount.email,
           });
-          await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
+          await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
         } else {
           await b2Upload(session, path, encrypted);
           await saveEncryptedVideoMetadata(session.user.id, path, { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
@@ -1046,7 +1046,7 @@ function App() {
       if (!encryptedBlob || typeof encryptedBlob.arrayBuffer !== 'function') throw new Error('Lo spazio di archiviazione non ha restituito un file valido.');
       const decrypted = await decryptVideo(encryptedBlob, vaultKey, item.mime);
       createVideoPoster(decrypted).then(poster => { if (poster) setThumbnails(current => ({ ...current, [item.path]: poster })); }).catch(() => {});
-      await logActivity(session.user.id, 'video_opened', item.displayName || getDisplayName(item.name), 'Video aperto nella libreria privata');
+      await logActivity(session.user.id, 'video_opened', null, 'Video aperto nella libreria privata');
       if (previewUrl) URL.revokeObjectURL(previewUrl);
       const url = URL.createObjectURL(decrypted);
       setPreviewUrl(url);
@@ -1101,7 +1101,7 @@ function App() {
     }
     const { error: sharesMoveError } = await supabase.from('vault_shares').update({ original_path: newPath, file_name: clean + extension }).eq('user_id', session.user.id).eq('original_path', renameItem.path).is('revoked_at', null);
     if (sharesMoveError) setError('Video rinominato, ma non ho aggiornato il collegamento dei link già creati: ' + sharesMoveError.message);
-    await logActivity(session.user.id, 'video_renamed', clean, 'Video rinominato');
+    await logActivity(session.user.id, 'video_renamed', null, 'Video rinominato');
     setRenameItem(null); setRenameValue('');
     await loadVideos();
   }
@@ -1143,7 +1143,7 @@ function App() {
       const signedUrl = await b2SignedUrl(session, sharePath, SHARE_SECONDS);
       const { data: shareRecord, error: recordError } = await supabase.from('vault_shares').insert({
         user_id: session.user.id, original_path: shareItem.path, storage_path: sharePath,
-        file_name: shareItem.displayName || getDisplayName(shareItem.name), expires_at: expiresAt
+        file_name: 'Video cifrato', expires_at: expiresAt
       }).select('id').single();
       if (recordError) throw recordError;
       shareRecordId = shareRecord?.id || '';
@@ -1160,7 +1160,7 @@ function App() {
         url = window.location.origin + window.location.pathname + '#share=' + encodeURIComponent(JSON.stringify(payload));
       }
       setShareUrl(url);
-      await logActivity(session.user.id, 'share_created', shareItem.displayName || getDisplayName(shareItem.name), 'Creato link temporaneo con copia separata revocabile');
+      await logActivity(session.user.id, 'share_created', null, 'Creato link temporaneo con copia separata revocabile');
       await loadSecurityData();
       await loadVideos();
     } catch (e) {
@@ -1242,7 +1242,7 @@ function App() {
     } catch (deleteError) { setError(deleteError.message); return; }
     {
       await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, item.path));
-      await logActivity(session.user.id, 'video_deleted', item.displayName || getDisplayName(item.name), 'Video eliminato dalla libreria');
+      await logActivity(session.user.id, 'video_deleted', null, 'Video eliminato dalla libreria');
       setVideos(current => current.filter(v => v.id !== item.id));
       if (shareItem?.id === item.id) {
         setShareItem(null);
