@@ -139,6 +139,7 @@ function App() {
   const [uploading, setUploading] = useState(false);
   const [migrating, setMigrating] = useState(false);
   const [migrationProgress, setMigrationProgress] = useState('');
+  const migrationStarted = useRef(false);
   const [progressName, setProgressName] = useState('');
   const [shareItem, setShareItem] = useState(null);
   const [shareUrl, setShareUrl] = useState('');
@@ -280,6 +281,16 @@ function App() {
     setVideos(withUrls);
     setLoadingVideos(false);
   }, [session, vaultKey]);
+
+  useEffect(() => {
+    if (!session) {
+      migrationStarted.current = false;
+      return;
+    }
+    if (!vaultKey || migrationStarted.current) return;
+    migrationStarted.current = true;
+    migrateVideosToBackblaze();
+  }, [session?.access_token, vaultKey]);
 
   useEffect(() => {
     if (session && vaultKey) loadVideos();
@@ -450,68 +461,35 @@ function App() {
   }
 
   async function migrateVideosToBackblaze() {
-    if (!session?.user?.id || migrating) return;
-    if (!window.confirm('Copierò su Backblaze tutti i video presenti su Supabase. Gli originali resteranno su Supabase e non verrà eliminato nulla. Vuoi iniziare?')) return;
+    if (!session?.access_token || migrating) return;
     setMigrating(true);
-    setMigrationProgress('Controllo dei video su Supabase…');
+    setMigrationProgress('Copia sicura dal server a Backblaze…');
     setError('');
-    let copied = 0;
-    let skipped = 0;
     try {
-      const allItems = [];
-      for (let offset = 0; ; offset += 100) {
-        const { data, error: listError } = await supabase.storage.from(BUCKET).list(session.user.id, {
-          limit: 100, offset, sortBy: { column: 'created_at', order: 'asc' }
-        });
-        if (listError) throw listError;
-        const page = (data || []).filter(item => item.name && item.id);
-        allItems.push(...page);
-        if (page.length < 100) break;
+      const response = await fetch('/api/storage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + session.access_token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'migrate' }),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 207) {
+        throw new Error(result.error || 'Migrazione non riuscita (HTTP ' + response.status + ').');
       }
-      if (!allItems.length) {
-        setMessage('Non ci sono video da copiare su Backblaze.');
-        return;
+      const data = result.data || {};
+      const copied = Array.isArray(data.copied) ? data.copied : [];
+      const skipped = Array.isArray(data.skipped) ? data.skipped : [];
+      const failures = Array.isArray(data.failures) ? data.failures : [];
+      if (failures.length) {
+        const first = failures[0];
+        throw new Error('Copiati: ' + copied.length + ', già presenti: ' + skipped.length + '. Problema con ' + (first.name || 'un file') + ': ' + (first.error || 'errore sconosciuto') + '. Gli originali su Supabase sono rimasti intatti.');
       }
-      for (let index = 0; index < allItems.length; index++) {
-        const item = allItems[index];
-        const path = session.user.id + '/' + item.name;
-        setMigrationProgress('Copia ' + (index + 1) + ' di ' + allItems.length + ': ' + getDisplayName(item.name));
-        const auth = { Authorization: 'Bearer ' + session.access_token, 'Content-Type': 'application/json' };
-        const verifyResponse = await fetch('/api/storage', { method: 'POST', headers: auth, body: JSON.stringify({ action: 'verify', path }) });
-        if (verifyResponse.ok) {
-          const verified = await verifyResponse.json();
-          if (Number(verified?.data?.size) === Number(item.metadata?.size || 0)) {
-            skipped++;
-            continue;
-          }
-          throw new Error('Esiste già una copia con dimensione diversa per ' + item.name + '. Nessun originale è stato modificato.');
-        }
-        if (verifyResponse.status !== 404) {
-          const detail = await verifyResponse.json().catch(() => ({}));
-          throw new Error(detail.error || 'Verifica Backblaze non riuscita (HTTP ' + verifyResponse.status + ').');
-        }
-        const { data: sourceBlob, error: downloadError } = await supabase.storage.from(BUCKET).download(path);
-        if (downloadError || !sourceBlob) throw new Error('Download da Supabase non riuscito per ' + item.name + ': ' + (downloadError?.message || 'file assente'));
-        const signedResponse = await fetch('/api/storage', { method: 'POST', headers: auth, body: JSON.stringify({ action: 'uploadUrl', path }) });
-        const signedData = await signedResponse.json().catch(() => ({}));
-        if (!signedResponse.ok || !signedData.url) throw new Error(signedData.error || 'Non riesco a preparare il caricamento su Backblaze.');
-        const uploadResponse = await fetch(signedData.url, {
-          method: 'PUT',
-          headers: { 'Content-Type': 'application/octet-stream', 'Cache-Control': 'no-store' },
-          body: sourceBlob
-        });
-        if (!uploadResponse.ok) throw new Error('Caricamento Backblaze fallito per ' + item.name + ' (HTTP ' + uploadResponse.status + ').');
-        const confirmResponse = await fetch('/api/storage', { method: 'POST', headers: auth, body: JSON.stringify({ action: 'verify', path }) });
-        const confirmData = await confirmResponse.json().catch(() => ({}));
-        if (!confirmResponse.ok || Number(confirmData?.data?.size) !== Number(sourceBlob.size)) {
-          throw new Error('La copia di ' + item.name + ' non ha superato la verifica dimensionale.');
-        }
-        copied++;
-      }
-      setMessage('Copia completata: ' + copied + ' video copiati e ' + skipped + ' già presenti e verificati su Backblaze. Gli originali Supabase sono rimasti intatti.');
-      await logActivity(session.user.id, 'other', null, 'Copia di sicurezza su Backblaze: ' + copied + ' copiati, ' + skipped + ' già presenti');
+      setMessage('Backup completato e verificato: ' + copied.length + ' video copiati, ' + skipped.length + ' già presenti su Backblaze. Gli originali su Supabase sono rimasti intatti.');
+      await logActivity(session.user.id, 'other', null, 'Backup Backblaze verificato: ' + copied.length + ' copiati, ' + skipped.length + ' già presenti');
     } catch (e) {
-      setError('Migrazione interrotta: ' + (e.message || 'errore sconosciuto') + ' I file originali su Supabase non sono stati eliminati.');
+      setError('Backup su Backblaze non completato: ' + (e.message || 'errore sconosciuto') + ' Nessun originale su Supabase è stato eliminato.');
     } finally {
       setMigrating(false);
       setMigrationProgress('');
@@ -975,7 +953,7 @@ function App() {
       <section className="welcome">
         <div><div className="eyebrow"><span className="pulse-dot"/> IL TUO SPAZIO PERSONALE</div><h1>La tua <span>cassaforte.</span></h1><p>I nuovi video vengono cifrati sul dispositivo prima del caricamento.</p></div>
         <div style={{display:'flex',gap:10,flexWrap:'wrap',justifyContent:'flex-end'}}>
-          <button className="secondary-btn" type="button" onClick={migrateVideosToBackblaze} disabled={migrating || uploading}>{migrating ? <><LoaderCircle className="spin" size={17}/> Copia in corso…</> : <><HardDrive size={17}/> Copia su Backblaze</>}</button>
+          
           <label className="upload-btn"><UploadCloud size={18}/> Carica video<input type="file" accept="video/*" multiple hidden onChange={handleUpload}/></label>
         </div>
       </section>
