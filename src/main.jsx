@@ -17,8 +17,16 @@ async function b2Request(session, payload) {
   return result;
 }
 async function b2ListAll(session) {
-  const all=[];
-  for(let offset=0;;offset+=100){ const result=await b2Request(session,{action:'list',offset,limit:100}); const page=result.data||[]; all.push(...page); if(page.length<100) break; }
+  const all = [];
+  let continuationToken = null;
+  do {
+    const result = await b2Request(session, {
+      action: 'list',
+      ...(continuationToken ? { continuationToken } : {}),
+    });
+    all.push(...(result.data || []));
+    continuationToken = result.nextContinuationToken || null;
+  } while (continuationToken);
   return all;
 }
 async function b2Download(session,path){ const r=await b2Request(session,{action:'downloadUrl',path}); const response=await fetch(r.url); if(!response.ok) throw new Error('Download Backblaze non riuscito (HTTP '+response.status+').'); return response.blob(); }
@@ -318,6 +326,7 @@ function App() {
   const [storageQuota, setStorageQuota] = useState(null);
   const [googleAccounts, setGoogleAccounts] = useState([]);
   const [storageDestination, setStorageDestination] = useState('backblaze');
+  const [uploadDestinationOpen, setUploadDestinationOpen] = useState(false);
   const [googleDriveError, setGoogleDriveError] = useState('');
   const [googleConnectBusy, setGoogleConnectBusy] = useState(false);
   const [googleDisconnectId, setGoogleDisconnectId] = useState('');
@@ -373,6 +382,8 @@ function App() {
   const [nowTick, setNowTick] = useState(() => Date.now());
   const notifiedShareIds = useRef(new Set());
   const videoElementRef = useRef(null);
+  const uploadInputRef = useRef(null);
+  const uploadDestinationRef = useRef('backblaze');
 
   useEffect(() => {
     const clock = window.setInterval(() => setNowTick(Date.now()), 60_000);
@@ -825,6 +836,27 @@ function App() {
     }
   }
 
+  function openUploadDestination() {
+    setError('');
+    setUploadDestinationOpen(true);
+  }
+
+  function chooseUploadDestination(destination) {
+    if (destination.startsWith('google:')) {
+      const accountId = destination.slice('google:'.length);
+      const account = googleAccounts.find(row => row.id === accountId);
+      if (!account || account.status === 'error') {
+        setError('Questo account Google non è disponibile. Controlla il collegamento nelle impostazioni di archiviazione.');
+        return;
+      }
+    }
+    uploadDestinationRef.current = destination;
+    setStorageDestination(destination);
+    setUploadDestinationOpen(false);
+    // Aprire il selettore nello stesso gesto dell'utente è necessario su Safari/iOS.
+    uploadInputRef.current?.click();
+  }
+
   async function handleUpload(event) {
     const selected = Array.from(event.target.files || []);
     event.target.value = '';
@@ -835,8 +867,9 @@ function App() {
       return;
     }
     if (!vaultKey) { setError('Sblocca prima la cassaforte con la tua frase segreta.'); return; }
-    const isGoogleDestination = storageDestination.startsWith('google:');
-    const googleAccountId = isGoogleDestination ? storageDestination.slice('google:'.length) : '';
+    const selectedDestination = uploadDestinationRef.current || storageDestination;
+    const isGoogleDestination = selectedDestination.startsWith('google:');
+    const googleAccountId = isGoogleDestination ? selectedDestination.slice('google:'.length) : '';
     const googleAccount = isGoogleDestination ? googleAccounts.find(account => account.id === googleAccountId) : null;
     if (isGoogleDestination && !googleAccount) {
       setError('Seleziona un account Google Drive collegato e disponibile.');
@@ -849,6 +882,7 @@ function App() {
 
     setUploading(true);
     setError('');
+    const uploadedDriveItems = [];
     for (const file of selected) {
       setProgressName(file.name);
       const safeName = file.name.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
@@ -857,7 +891,22 @@ function App() {
       try {
         const encrypted = await encryptVideo(file, vaultKey);
         if (isGoogleDestination) {
-          await googleUpload(session, googleAccountId, storedName, encrypted);
+          const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
+          uploadedDriveItems.push({
+            id: 'google-' + googleAccountId + '-' + saved.id,
+            fileId: saved.id,
+            accountId: googleAccountId,
+            accountEmail: googleAccount.email,
+            path: 'google:' + googleAccountId + ':' + saved.id,
+            name: saved.name || storedName,
+            displayName: getDisplayName(saved.name || storedName),
+            size: Number(saved.size || encrypted.size),
+            created_at: saved.created_at || new Date().toISOString(),
+            mime: getOriginalVideoMime(storedName),
+            encrypted: true,
+            provider: 'google',
+            providerLabel: 'Google Drive · ' + googleAccount.email,
+          });
           await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
         } else {
           await b2Upload(session, path, encrypted);
@@ -871,6 +920,13 @@ function App() {
     setUploading(false);
     setProgressName('');
     await loadVideos();
+    if (uploadedDriveItems.length) {
+      setVideos(current => {
+        const byId = new Map(current.map(item => [item.id, item]));
+        uploadedDriveItems.forEach(item => byId.set(item.id, item));
+        return Array.from(byId.values());
+      });
+    }
   }
 
   async function openEncryptedVideo(item) {
@@ -1286,7 +1342,8 @@ function App() {
         <div><div className="eyebrow"><span className="pulse-dot"/> IL TUO SPAZIO PERSONALE</div><h1>La tua <span>cassaforte.</span></h1><p>I nuovi video vengono cifrati sul dispositivo prima del caricamento.</p></div>
         <div style={{display:'flex',gap:10,flexWrap:'wrap',justifyContent:'flex-end'}}>
           
-          <label className="upload-btn"><UploadCloud size={18}/> Carica video<input type="file" accept="video/*" multiple hidden onChange={handleUpload}/></label>
+          <button className="upload-btn" type="button" onClick={openUploadDestination}><UploadCloud size={18}/> Carica video</button>
+          <input ref={uploadInputRef} type="file" accept="video/*" multiple hidden onChange={handleUpload}/>
         </div>
       </section>
       <section className="stats">
@@ -1296,11 +1353,12 @@ function App() {
       </section>
 
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
+      {uploadDestinationOpen && <div className="modal-backdrop" onClick={() => setUploadDestinationOpen(false)}><div className="share-modal upload-destination-modal" onClick={event => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setUploadDestinationOpen(false)} aria-label="Chiudi"><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">NUOVO CARICAMENTO</div><h2>Dove vuoi salvarlo?</h2><p>Scegli la destinazione per questo caricamento. Il video verrà cifrato sul dispositivo prima del trasferimento.</p><div className="upload-destination-options"><button className="upload-destination-option" type="button" onClick={() => chooseUploadDestination('backblaze')}><span className="upload-destination-icon"><ShieldCheck size={20}/></span><span><b>Backblaze B2</b><small>Spazio personale Vault</small></span><ArrowUpRight size={17}/></button>{googleAccounts.map(account => <button className="upload-destination-option" type="button" key={account.id} disabled={account.status === 'error'} onClick={() => chooseUploadDestination('google:' + account.id)}><span className="upload-destination-icon"><HardDrive size={20}/></span><span><b>Google Drive</b><small>{account.status === 'error' ? 'Account da ricollegare' : account.email}</small></span>{account.status === 'error' ? <AlertCircle size={17}/> : <ArrowUpRight size={17}/>}</button>)}</div>{googleAccounts.length === 0 && <button className="secondary-share-btn" type="button" onClick={() => {setUploadDestinationOpen(false);setStorageOpen(true);}}><HardDrive size={16}/> Collega Google Drive</button>}</div></div>}
       {error && <div className="notice error dashboard-notice"><AlertCircle size={16}/>{error}<button onClick={() => setError('')}><X size={15}/></button></div>}
       <section className="library">
         <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{videos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div></div></div>
         {loadingVideos ? <div className="empty-state"><LoaderCircle className="spin" size={24}/><p>Sto aprendo la cassaforte…</p></div> : visibleVideos.length === 0 ? (
-          <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{videos.length ? 'Nessun risultato' : 'La tua cassaforte è vuota'}</h3><p>{videos.length ? 'Prova con un altro nome.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.'}</p>{!videos.length && <label className="secondary-btn"><UploadCloud size={17}/> Seleziona video<input type="file" accept="video/*" multiple hidden onChange={handleUpload}/></label>}</div>
+          <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{videos.length ? 'Nessun risultato' : 'La tua cassaforte è vuota'}</h3><p>{videos.length ? 'Prova con un altro nome.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.'}</p>{!videos.length && <button className="secondary-btn" type="button" onClick={openUploadDestination}><UploadCloud size={17}/> Seleziona video</button>}</div>
         ) : (
           <div className="video-grid">{visibleVideos.map(item => (
             <article className="video-card" key={item.id}>

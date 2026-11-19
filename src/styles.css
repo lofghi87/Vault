@@ -193,3 +193,17 @@ button,input{min-width:0}
 .settings-detail-modal .storage-panel-head{align-items:flex-start}
 .settings-gear-btn{position:relative}
 @media(max-width:600px){.settings-menu-item{padding:13px}.settings-menu-icon{width:36px;height:36px;flex-basis:36px}.settings-detail-modal{max-height:90vh}}
+
+
+/* Per-upload storage destination picker */
+.upload-destination-modal{width:min(100%,500px)}
+.upload-destination-options{display:grid;gap:10px;margin-top:20px}
+.upload-destination-option{width:100%;display:flex;align-items:center;gap:13px;padding:14px;border:1px solid #34383f;border-radius:12px;background:#101215;color:#f0f0f1;text-align:left;transition:border-color .18s,background .18s}
+.upload-destination-option:hover:not(:disabled){border-color:#9d7d49;background:#1a1711}
+.upload-destination-option>span:nth-child(2){display:grid;gap:4px;flex:1;min-width:0}
+.upload-destination-option b{font-size:13px}
+.upload-destination-option small{font-size:10px;color:#9298a1;overflow-wrap:anywhere}
+.upload-destination-option>svg:last-child{color:var(--gold);flex:0 0 auto}
+.upload-destination-icon{width:40px;height:40px;display:grid;place-items:center;flex:0 0 40px;border:1px solid #493b25;border-radius:11px;background:#211b12;color:var(--gold2)}
+.upload-destination-option:disabled{opacity:.55;cursor:not-allowed}
+@media(max-width:600px){.upload-destination-modal{padding:22px 18px}.upload-destination-option{padding:12px}}
