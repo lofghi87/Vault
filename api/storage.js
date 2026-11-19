@@ -1,5 +1,6 @@
 import { createClient } from '@supabase/supabase-js';
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
 import { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand, DeleteObjectsCommand, CopyObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -25,6 +26,16 @@ function safeKey(value, userId) {
   }
   if (!value.startsWith(userId + '/')) throw new Error('Accesso non autorizzato al percorso.');
   return value;
+}
+
+async function sha256Stream(stream) {
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const chunk of stream) {
+    hash.update(chunk);
+    size += chunk.length;
+  }
+  return { sha256: hash.digest('hex'), size };
 }
 
 export default async function handler(req, res) {
@@ -153,6 +164,58 @@ export default async function handler(req, res) {
         data: { copied, skipped, failures, total: copied.length + skipped.length + failures.length },
         summary,
         message: failures.length ? 'Copia parziale: gli originali su Supabase sono rimasti intatti.' : 'Copia completata e verificata. Gli originali su Supabase sono rimasti intatti.',
+      });
+    }
+
+    if (action === 'verifyMigration') {
+      const startedAt = Date.now();
+      const sourceClient = createClient(process.env.VITE_SUPABASE_URL, process.env.VITE_SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { Authorization: 'Bearer ' + token } },
+      });
+      const checked = [];
+      const failures = [];
+      const pageSize = 100;
+      let scanned = 0;
+      for (let offset = 0; ; offset += pageSize) {
+        const { data: page, error: listError } = await sourceClient.storage.from('vault-videos').list(userId, {
+          limit: pageSize, offset, sortBy: { column: 'created_at', order: 'asc' },
+        });
+        if (listError) throw new Error('Lettura elenco Supabase non riuscita: ' + listError.message);
+        const items = (page || []).filter(item => item?.name && item?.id);
+        scanned += items.length;
+        for (const item of items) {
+          const key = safeKey(userId + '/' + item.name, userId);
+          try {
+            const { data: signed, error: signedError } = await sourceClient.storage.from('vault-videos').createSignedUrl(key, 300);
+            if (signedError || !signed?.signedUrl) throw new Error('Link Supabase non disponibile: ' + (signedError?.message || 'nessun URL'));
+            const sourceResponse = await fetch(signed.signedUrl);
+            if (!sourceResponse.ok || !sourceResponse.body) throw new Error('Lettura originale Supabase fallita (HTTP ' + sourceResponse.status + ').');
+            const sourceHash = await sha256Stream(Readable.fromWeb(sourceResponse.body));
+            const target = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+            if (!target.Body) throw new Error('File assente o vuoto su Backblaze.');
+            const targetHash = await sha256Stream(target.Body);
+            const matches = sourceHash.size === targetHash.size && sourceHash.sha256 === targetHash.sha256;
+            checked.push({ name: item.name, size: sourceHash.size, matches });
+            if (!matches) failures.push({ name: item.name, error: 'Il contenuto su Backblaze non coincide byte per byte con l’originale.' });
+          } catch (itemError) {
+            failures.push({ name: item.name, error: itemError?.message || 'Errore sconosciuto durante la verifica.' });
+          }
+        }
+        if (items.length < pageSize) break;
+      }
+      const summary = {
+        scanned,
+        checked: checked.length,
+        verified: checked.filter(item => item.matches).length,
+        failures: failures.length,
+        durationMs: Date.now() - startedAt,
+      };
+      console.info('[Vault B2 integrity] finished', summary);
+      return send(res, failures.length ? 207 : 200, {
+        data: { checked, failures },
+        summary,
+        message: failures.length ? 'Verifica integrità non superata per tutti i file.' : 'Tutti i file verificati: SHA-256 identico tra Supabase e Backblaze.',
       });
     }
 
