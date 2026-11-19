@@ -10,65 +10,6 @@ const supabase = createClient(supabaseUrl, supabaseKey);
 const BUCKET = 'vault-videos';
 const SHARE_SECONDS = 60 * 60;
 
-async function b2Request(session, action, payload = {}) {
-  const { data: sessionData } = await supabase.auth.getSession();
-  const token = sessionData?.session?.access_token;
-  if (!token) throw new Error('Sessione non valida. Accedi di nuovo.');
-  const response = await fetch('/api/storage', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + token },
-    body: JSON.stringify({ action, ...payload }),
-  });
-  const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.error || 'Errore dello storage Backblaze.');
-  return result;
-}
-
-function b2Storage(session) {
-  return {
-    list: async (prefix, options = {}) => {
-      try {
-        const result = await b2Request(session, 'list', { prefix, limit: options.limit || 100, offset: options.offset || 0 });
-        return { data: result.data || [], error: null };
-      } catch (error) { return { data: null, error }; }
-    },
-    upload: async (path, blob) => {
-      try {
-        const { url } = await b2Request(session, 'uploadUrl', { path });
-        const response = await fetch(url, { method: 'PUT', headers: { 'Content-Type': 'application/octet-stream' }, body: blob });
-        if (!response.ok) throw new Error('Caricamento su Backblaze non riuscito (' + response.status + ').');
-        return { data: { path }, error: null };
-      } catch (error) { return { data: null, error }; }
-    },
-    download: async path => {
-      try {
-        const { url } = await b2Request(session, 'downloadUrl', { path });
-        const response = await fetch(url);
-        if (!response.ok) throw new Error('Download da Backblaze non riuscito (' + response.status + ').');
-        return { data: await response.blob(), error: null };
-      } catch (error) { return { data: null, error }; }
-    },
-    remove: async paths => {
-      try { await b2Request(session, 'delete', { paths }); return { data: paths, error: null }; }
-      catch (error) { return { data: null, error }; }
-    },
-    move: async (from, to) => {
-      try { await b2Request(session, 'move', { from, to }); return { data: { path: to }, error: null }; }
-      catch (error) { return { data: null, error }; }
-    },
-    copy: async (from, to) => {
-      try { await b2Request(session, 'copy', { from, to }); return { data: { path: to }, error: null }; }
-      catch (error) { return { data: null, error }; }
-    },
-    createSignedUrl: async (path, seconds) => {
-      try {
-        const { url } = await b2Request(session, 'sign', { path, seconds });
-        return { data: { signedUrl: url }, error: null };
-      } catch (error) { return { data: null, error }; }
-    },
-  };
-}
-
 function getDisplayName(name) {
   return name.replace(/^[0-9a-f-]{30,}-/i, '').replace(/\.vlt$/i, '');
 }
@@ -175,7 +116,8 @@ function parseIncomingShare() {
     if (!raw) return null;
     const payload = JSON.parse(raw);
     const signedUrl = new URL(payload.url);
-    if (signedUrl.hostname !== 's3.eu-central-003.backblazeb2.com' || !signedUrl.pathname.includes('/' + BUCKET + '/')) return null;
+    const storageOrigin = new URL(supabaseUrl).origin;
+    if (signedUrl.origin !== storageOrigin || !signedUrl.pathname.includes('/storage/v1/object/sign/' + BUCKET + '/')) return null;
     if (!payload.key || !payload.name || !payload.mime || base64ToBytes(payload.key).length !== 32) return null;
     return payload;
   } catch { return null; }
@@ -307,7 +249,7 @@ function App() {
     if (!session?.user?.id || !vaultKey) return;
     setLoadingVideos(true);
     setError('');
-    const { data, error: listError } = await b2Storage(session).list(session.user.id, {
+    const { data, error: listError } = await supabase.storage.from(BUCKET).list(session.user.id, {
       limit: 100,
       sortBy: { column: 'created_at', order: 'desc' }
     });
@@ -421,7 +363,7 @@ function App() {
       const { data: activeShares, error: activeSharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).is('revoked_at', null);
       if (activeSharesError) throw new Error('Non riesco a controllare i link temporanei: ' + activeSharesError.message);
       if (activeShares?.length) {
-        const { error: removeSharesError } = await b2Storage(session).remove(activeShares.map(share => share.storage_path));
+        const { error: removeSharesError } = await supabase.storage.from(BUCKET).remove(activeShares.map(share => share.storage_path));
         if (removeSharesError) throw new Error('Non riesco a revocare i link temporanei: ' + removeSharesError.message);
         const { error: markSharesError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', activeShares.map(share => share.id));
         if (markSharesError) console.warn('Copie dei link rimosse, ma alcuni record non sono stati aggiornati:', markSharesError.message);
@@ -430,7 +372,7 @@ function App() {
       const allItems = [];
       const pageSize = 100;
       for (let offset = 0; ; offset += pageSize) {
-        const { data, error: listError } = await b2Storage(session).list(session.user.id, {
+        const { data, error: listError } = await supabase.storage.from(BUCKET).list(session.user.id, {
           limit: pageSize, offset, sortBy: { column: 'created_at', order: 'asc' }
         });
         if (listError) throw listError;
@@ -453,7 +395,7 @@ function App() {
           const displayName = getDisplayName(item.name);
           const mime = item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || 'video/mp4');
           setRotationProgress('Cifratura e verifica ' + (index + 1) + ' di ' + allItems.length + ': ' + displayName);
-          const { data, error: downloadError } = await b2Storage(session).download(oldPath);
+          const { data, error: downloadError } = await supabase.storage.from(BUCKET).download(oldPath);
           if (downloadError || !data) throw new Error('Download non riuscito per "' + displayName + '": ' + (downloadError?.message || 'file non disponibile'));
           const plain = item.name.endsWith('.vlt') ? await decryptVideo(data, vaultKey, mime) : data;
           const encrypted = await encryptVideo(plain, newKey);
@@ -461,19 +403,19 @@ function App() {
           await decryptVideo(encrypted, newKey, mime);
           const safeName = displayName.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
           const newPath = session.user.id + '/' + crypto.randomUUID() + '-' + safeName + '.vlt';
-          const { error: uploadError } = await b2Storage(session).upload(newPath, encrypted, {
+          const { error: uploadError } = await supabase.storage.from(BUCKET).upload(newPath, encrypted, {
             cacheControl: '0', contentType: 'application/octet-stream', upsert: false
           });
           if (uploadError) throw new Error('Caricamento della nuova copia non riuscito per "' + displayName + '": ' + uploadError.message);
           stagedPaths.push(newPath);
           // Verifica anche la copia effettivamente salvata sul server.
-          const { data: savedCopy, error: verifyError } = await b2Storage(session).download(newPath);
+          const { data: savedCopy, error: verifyError } = await supabase.storage.from(BUCKET).download(newPath);
           if (verifyError || !savedCopy) throw new Error('Verifica della nuova copia non riuscita per "' + displayName + '".');
           await decryptVideo(savedCopy, newKey, mime);
           oldPaths.push(oldPath);
         }
         setRotationProgress('Tutti i video sono verificati. Sostituzione degli originali…');
-        const { error: removeError } = await b2Storage(session).remove(oldPaths);
+        const { error: removeError } = await supabase.storage.from(BUCKET).remove(oldPaths);
         if (removeError) throw new Error('Le nuove copie sono pronte, ma non sono riuscito a completare la sostituzione degli originali: ' + removeError.message);
         setVaultKey(newKey);
         setSettingsOpen(false);
@@ -486,7 +428,7 @@ function App() {
       setVaultPassphrase('');
     } catch (e) {
       if (stagedPaths.length) {
-        await b2Storage(session).remove(stagedPaths);
+        await supabase.storage.from(BUCKET).remove(stagedPaths);
       }
       setError('Modifica della frase non completata: ' + (e.message || 'errore sconosciuto') + ' I video originali sono stati mantenuti.');
     } finally {
@@ -522,7 +464,7 @@ function App() {
       const path = session.user.id + '/' + crypto.randomUUID() + '-' + safeName + '.vlt';
       try {
         const encrypted = await encryptVideo(file, vaultKey);
-        const { error: uploadError } = await b2Storage(session).upload(path, encrypted, { cacheControl: '0', contentType: 'application/octet-stream', upsert: false });
+        const { error: uploadError } = await supabase.storage.from(BUCKET).upload(path, encrypted, { cacheControl: '0', contentType: 'application/octet-stream', upsert: false });
         if (uploadError) throw uploadError;
         const { error: metaError } = await supabase.from('vault_video_meta').upsert(
           { user_id: session.user.id, storage_path: path, folder_name: 'Generale', updated_at: new Date().toISOString() },
@@ -545,7 +487,7 @@ function App() {
     setOpeningVideoId(item.id);
     setError('');
     try {
-      const result = await b2Storage(session).download(item.path);
+      const result = await supabase.storage.from(BUCKET).download(item.path);
       if (result.error) throw new Error('Download non riuscito: ' + result.error.message);
       if (!result.data || typeof result.data.arrayBuffer !== 'function') throw new Error('Supabase non ha restituito un file valido.');
       const decrypted = await decryptVideo(result.data, vaultKey, item.mime);
@@ -583,7 +525,7 @@ function App() {
     const newName = crypto.randomUUID() + '-' + clean + extension + '.vlt';
     const newPath = session.user.id + '/' + newName;
     setRenameBusy(true); setError('');
-    const { error: moveError } = await b2Storage(session).move(renameItem.path, newPath);
+    const { error: moveError } = await supabase.storage.from(BUCKET).move(renameItem.path, newPath);
     setRenameBusy(false);
     if (moveError) { setError('Non sono riuscito a rinominare il video: ' + moveError.message); return; }
     const { error: metaError } = await supabase.from('vault_video_meta').update({ storage_path: newPath, updated_at: new Date().toISOString() }).eq('user_id', session.user.id).eq('storage_path', renameItem.path);
@@ -623,10 +565,10 @@ function App() {
       const shareId = crypto.randomUUID();
       const safeName = (shareItem.displayName || getDisplayName(shareItem.name)).normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-90) || 'video';
       sharePath = session.user.id + '/_shares/' + shareId + '/' + safeName + (shareItem.encrypted ? '.vlt' : '');
-      const { error: copyError } = await b2Storage(session).copy(shareItem.path, sharePath);
+      const { error: copyError } = await supabase.storage.from(BUCKET).copy(shareItem.path, sharePath);
       if (copyError) throw copyError;
       const expiresAt = new Date(Date.now() + SHARE_SECONDS * 1000).toISOString();
-      const { data, error: signError } = await b2Storage(session).createSignedUrl(sharePath, SHARE_SECONDS, { download: false });
+      const { data, error: signError } = await supabase.storage.from(BUCKET).createSignedUrl(sharePath, SHARE_SECONDS, { download: false });
       if (signError) throw signError;
       const { data: shareRecord, error: recordError } = await supabase.from('vault_shares').insert({
         user_id: session.user.id, original_path: shareItem.path, storage_path: sharePath,
@@ -651,7 +593,7 @@ function App() {
       await loadSecurityData();
     } catch (e) {
       if (shareRecordId) await supabase.from('vault_shares').delete().eq('id', shareRecordId).eq('user_id', session.user.id);
-      if (sharePath) await b2Storage(session).remove([sharePath]);
+      if (sharePath) await supabase.storage.from(BUCKET).remove([sharePath]);
       setError('Non sono riuscito a creare il link: ' + (e.message || 'errore sconosciuto'));
     } finally {
       setShareBusy(false);
@@ -663,7 +605,7 @@ function App() {
     setShareBusy(true);
     setError('');
     try {
-      const { data, error: downloadError } = await b2Storage(session).download(shareItem.path);
+      const { data, error: downloadError } = await supabase.storage.from(BUCKET).download(shareItem.path);
       if (downloadError) throw downloadError;
       const content = shareItem.encrypted ? await decryptVideo(data, vaultKey, shareItem.mime) : data;
       const filename = shareItem.displayName || getDisplayName(shareItem.name);
@@ -714,11 +656,11 @@ function App() {
     const { data: linkedShares, error: sharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).eq('original_path', item.path).is('revoked_at', null);
     if (sharesError) { setError('Non riesco a verificare i link attivi: ' + sharesError.message); return; }
     if (linkedShares?.length) {
-      const { error: shareDeleteError } = await b2Storage(session).remove(linkedShares.map(row => row.storage_path));
+      const { error: shareDeleteError } = await supabase.storage.from(BUCKET).remove(linkedShares.map(row => row.storage_path));
       if (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
       await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', linkedShares.map(row => row.id));
     }
-    const { error: deleteError } = await b2Storage(session).remove([item.path]);
+    const { error: deleteError } = await supabase.storage.from(BUCKET).remove([item.path]);
     if (deleteError) setError(deleteError.message);
     else {
       await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', item.path);
@@ -752,7 +694,7 @@ function App() {
       let shareRows = shareResult.data || [];
       const expiredPending = shareRows.filter(row => !row.revoked_at && new Date(row.expires_at).getTime() <= Date.now());
       if (expiredPending.length) {
-        const { error: cleanupError } = await b2Storage(session).remove(expiredPending.map(row => row.storage_path));
+        const { error: cleanupError } = await supabase.storage.from(BUCKET).remove(expiredPending.map(row => row.storage_path));
         if (!cleanupError) {
           const { error: markError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', expiredPending.map(row => row.id));
           if (!markError) shareRows = shareRows.map(row => expiredPending.some(expired => expired.id === row.id) ? { ...row, revoked_at: new Date().toISOString() } : row);
@@ -769,7 +711,7 @@ function App() {
 
   async function revokeShare(share) {
     if (!window.confirm('Revocare questo link? Vault rimuoverà la copia temporanea condivisa. Chi ha già scaricato il video o ne ha conservato una copia non può essere disconnesso da remoto.')) return;
-    const { error: removeError } = await b2Storage(session).remove([share.storage_path]);
+    const { error: removeError } = await supabase.storage.from(BUCKET).remove([share.storage_path]);
     if (removeError) { setError('Non riesco a rimuovere la copia condivisa: ' + removeError.message); return; }
     const { error: updateError } = await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).eq('id', share.id).eq('user_id', session.user.id);
     if (updateError) setError('Copia condivisa rimossa, ma registro non aggiornato: ' + updateError.message);
@@ -982,7 +924,7 @@ function App() {
           ))}</div>
         )}
       </section>
-      <footer className="dash-footer"><span><ShieldCheck size={14}/> I nuovi caricamenti sono cifrati sul dispositivo prima di arrivare a Backblaze.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
+      <footer className="dash-footer"><span><ShieldCheck size={14}/> I nuovi caricamenti sono cifrati prima di arrivare a Supabase.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
       {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
       {accountOpen && <div className="modal-backdrop" onClick={() => !accountBusy && setAccountOpen(false)}><div className="share-modal account-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !accountBusy && setAccountOpen(false)}><X size={18}/></button><div className="modal-icon"><UserRound size={21}/></div><div className="section-kicker">IL TUO ACCOUNT</div><h2>Profilo e credenziali</h2><p>Gestisci i dati dell’account. La frase segreta Vault resta separata dalla password.</p><div className="account-field"><label>Email attuale</label><div className="account-current">{session.user.email}</div></div><label>Nome visualizzato</label><div className="input-wrap"><UserRound size={17}/><input value={accountName} onChange={e => setAccountName(e.target.value)} maxLength={60} placeholder="Nome profilo"/></div><button className="primary-btn copy-btn" type="button" disabled={accountBusy} onClick={saveAccountName}>{accountBusy ? <LoaderCircle className="spin" size={16}/> : <Check size={16}/>} Salva nome</button><div className="account-divider"/><label>Nuovo indirizzo email</label><div className="input-wrap"><Mail size={17}/><input type="email" value={accountEmail} onChange={e => setAccountEmail(e.target.value)} autoComplete="email" placeholder="nuova@email.com"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy} onClick={requestAccountEmailChange}>Richiedi cambio email</button><p className="card-sub account-hint">Il cambio potrebbe richiedere la conferma tramite email.</p><div className="account-divider"/><label>Nuova password dell’account</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={newAccountPassword} onChange={e => setNewAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Almeno 8 caratteri"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy || newAccountPassword.length < 8} onClick={updateAccountPassword}>Aggiorna password</button>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}</div></div>}
       {securityOpen && <div className="modal-backdrop" onClick={() => setSecurityOpen(false)}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSecurityOpen(false)}><X size={18}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata',folder_created:'Cartella creata',video_moved:'Video spostato'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
