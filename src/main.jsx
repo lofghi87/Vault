@@ -92,15 +92,93 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
   const started = await googleRequest(session, {
     action: 'startUpload', accountId, name, size: encryptedBlob.size,
   });
-  const response = await fetch(started.uploadUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': 'application/octet-stream' },
-    body: encryptedBlob,
-  });
-  const uploaded = await response.json().catch(() => ({}));
-  if (!response.ok || !uploaded.id) {
-    throw new Error('Caricamento su Google Drive non riuscito. Controlla la connessione e riprova.');
+  if (!started.uploadUrl) throw new Error('Google Drive non ha preparato il caricamento.');
+  const chunkSize = 8 * 1024 * 1024; // Multiplo di 256 KB, adatto ai video di grandi dimensioni.
+  let offset = 0;
+  let uploaded = null;
+
+  const probeUpload = async () => {
+    const response = await fetch(started.uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Range': 'bytes */' + encryptedBlob.size },
+      body: new Blob([]),
+    });
+    if (response.status === 200 || response.status === 201) {
+      return { nextOffset: encryptedBlob.size, uploaded: await response.json().catch(() => ({})) };
+    }
+    if (response.status !== 308) {
+      throw new Error('Non riesco a riprendere il caricamento su Google Drive.');
+    }
+    const range = response.headers.get('Range') || '';
+    const match = range.match(/^bytes=0-(\\d+)$/);
+    return { nextOffset: match ? Number(match[1]) + 1 : 0, uploaded: null };
+  };
+
+  while (offset < encryptedBlob.size) {
+    const end = Math.min(encryptedBlob.size, offset + chunkSize) - 1;
+    const chunk = encryptedBlob.slice(offset, end + 1);
+    let response;
+    try {
+      response = await fetch(started.uploadUrl, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/octet-stream',
+          'Content-Range': 'bytes ' + offset + '-' + end + '/' + encryptedBlob.size,
+        },
+        body: chunk,
+      });
+    } catch {
+      const progress = await probeUpload();
+      if (progress.uploaded) {
+        uploaded = progress.uploaded;
+        offset = encryptedBlob.size;
+        break;
+      }
+      if (progress.nextOffset === offset) {
+        throw new Error('Connessione interrotta durante il caricamento su Google Drive. Puoi riprovare senza ricifrare il video.');
+      }
+      offset = progress.nextOffset;
+      continue;
+    }
+
+    if (response.status === 200 || response.status === 201) {
+      uploaded = await response.json().catch(() => ({}));
+      offset = encryptedBlob.size;
+      break;
+    }
+    if (response.status !== 308) {
+      const progress = await probeUpload().catch(() => null);
+      if (progress?.uploaded) {
+        uploaded = progress.uploaded;
+        offset = encryptedBlob.size;
+        break;
+      }
+      throw new Error('Caricamento su Google Drive non riuscito (HTTP ' + response.status + '). Riprova.');
+    }
+
+    const range = response.headers.get('Range') || '';
+    const match = range.match(/^bytes=0-(\\d+)$/);
+    if (match) {
+      offset = Number(match[1]) + 1;
+    } else {
+      const progress = await probeUpload();
+      if (progress.uploaded) {
+        uploaded = progress.uploaded;
+        offset = encryptedBlob.size;
+      } else if (progress.nextOffset > offset) {
+        offset = progress.nextOffset;
+      } else {
+        throw new Error('Google Drive non ha confermato i dati caricati. Riprova.');
+      }
+    }
   }
+
+  if (!uploaded?.id) {
+    const progress = await probeUpload();
+    uploaded = progress.uploaded;
+  }
+  if (!uploaded?.id) throw new Error('Google Drive non ha confermato il completamento del caricamento.');
+
   const verified = await googleRequest(session, {
     action: 'verify', accountId, fileId: uploaded.id, expectedSize: encryptedBlob.size,
   });
