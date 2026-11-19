@@ -49,17 +49,43 @@ async function googleRequest(session, payload) {
   return result;
 }
 
-async function googleDownload(session, accountId, fileId) {
+async function googleDownload(session, accountId, fileId, size) {
+  const totalSize = Number(size || 0);
+  const chunkSize = 8 * 1024 * 1024;
+  const chunks = [];
   const query = new URLSearchParams({ action: 'download', accountId, fileId });
-  const response = await fetch('/api/google-drive?' + query.toString(), {
-    headers: { Authorization: 'Bearer ' + session.access_token },
-    cache: 'no-store',
-  });
-  if (!response.ok) {
-    const result = await response.json().catch(() => ({}));
-    throw new Error(result.error || 'Download da Google Drive non riuscito.');
+  const downloadChunk = async (start, end, useRange) => {
+    const headers = { Authorization: 'Bearer ' + session.access_token };
+    if (useRange) headers.Range = 'bytes=' + start + '-' + end;
+    const response = await fetch('/api/google-drive?' + query.toString(), {
+      headers,
+      cache: 'no-store',
+    });
+    if (!response.ok) {
+      const result = await response.json().catch(() => ({}));
+      throw new Error(result.error || 'Download da Google Drive non riuscito.');
+    }
+    if (useRange && response.status !== 206) {
+      throw new Error('Google Drive non ha restituito una parte valida del video. Riprova.');
+    }
+    const blob = await response.blob();
+    const expected = end - start + 1;
+    if (useRange && blob.size !== expected) {
+      throw new Error('Il download parziale da Google Drive è incompleto.');
+    }
+    chunks.push(blob);
+  };
+
+  if (!Number.isSafeInteger(totalSize) || totalSize <= 0 || totalSize <= chunkSize) {
+    await downloadChunk(0, Math.max(0, totalSize - 1), false);
+    return chunks[0];
   }
-  return response.blob();
+
+  for (let start = 0; start < totalSize; start += chunkSize) {
+    const end = Math.min(totalSize - 1, start + chunkSize - 1);
+    await downloadChunk(start, end, true);
+  }
+  return new Blob(chunks, { type: 'application/octet-stream' });
 }
 
 async function googleUpload(session, accountId, name, encryptedBlob) {
@@ -543,6 +569,7 @@ function App() {
           displayName: getDisplayName(item.name),
           mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || 'video/mp4'),
           encrypted: item.name.endsWith('.vlt'),
+          size: Number(item.metadata?.size || 0),
         });
       }
 
@@ -560,6 +587,7 @@ function App() {
             displayName: getDisplayName(item.name),
             mime: getOriginalVideoMime(item.name),
             encrypted: true,
+            size: Number(item.size || 0),
           });
         }
       }
@@ -575,7 +603,7 @@ function App() {
           const item = allItems[index];
           setRotationProgress('Cifratura e verifica ' + (index + 1) + ' di ' + allItems.length + ': ' + item.displayName);
           const data = item.provider === 'google'
-            ? await googleDownload(session, item.accountId, item.fileId)
+            ? await googleDownload(session, item.accountId, item.fileId, item.size)
             : await b2Download(session, item.path);
           const plain = item.encrypted ? await decryptVideo(data, vaultKey, item.mime) : data;
           const encrypted = await encryptVideo(plain, newKey);
@@ -742,7 +770,7 @@ function App() {
     setError('');
     try {
       const encryptedBlob = item.provider === 'google'
-        ? await googleDownload(session, item.accountId, item.fileId)
+        ? await googleDownload(session, item.accountId, item.fileId, item.size)
         : await b2Download(session, item.path);
       if (!encryptedBlob || typeof encryptedBlob.arrayBuffer !== 'function') throw new Error('Lo spazio di archiviazione non ha restituito un file valido.');
       const decrypted = await decryptVideo(encryptedBlob, vaultKey, item.mime);
@@ -828,7 +856,7 @@ function App() {
       const safeName = (shareItem.displayName || getDisplayName(shareItem.name)).normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').slice(-90) || 'video';
       sharePath = session.user.id + '/_shares/' + shareId + '/' + safeName + (shareItem.encrypted ? '.vlt' : '');
       if (shareItem.provider === 'google') {
-        const encryptedSource = await googleDownload(session, shareItem.accountId, shareItem.fileId);
+        const encryptedSource = await googleDownload(session, shareItem.accountId, shareItem.fileId, shareItem.size);
         await b2Upload(session, sharePath, encryptedSource);
       } else {
         await b2Copy(session, shareItem.path, sharePath);
@@ -872,7 +900,7 @@ function App() {
     setError('');
     try {
       const data = shareItem.provider === 'google'
-        ? await googleDownload(session, shareItem.accountId, shareItem.fileId)
+        ? await googleDownload(session, shareItem.accountId, shareItem.fileId, shareItem.size)
         : await b2Download(session, shareItem.path);
       const content = shareItem.encrypted ? await decryptVideo(data, vaultKey, shareItem.mime) : data;
       const filename = shareItem.displayName || getDisplayName(shareItem.name);
