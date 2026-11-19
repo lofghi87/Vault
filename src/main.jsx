@@ -197,6 +197,54 @@ function getDisplayName(name) {
   return name.replace(/^[0-9a-f-]{30,}-/i, '').replace(/\.vlt$/i, '');
 }
 
+async function sealVideoMetadata(metadata, key) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const plain = new TextEncoder().encode(JSON.stringify(metadata));
+  const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
+  return bytesToBase64(new Uint8Array([...iv, ...new Uint8Array(cipher)]));
+}
+
+async function openVideoMetadata(value, key) {
+  try {
+    const packed = base64ToBytes(value || '');
+    if (packed.length < 29) return null;
+    const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: packed.slice(0, 12) }, key, packed.slice(12));
+    const parsed = JSON.parse(new TextDecoder().decode(plain));
+    if (typeof parsed.name !== 'string' || typeof parsed.mime !== 'string') return null;
+    return { name: parsed.name, mime: parsed.mime };
+  } catch {
+    return null;
+  }
+}
+
+async function saveEncryptedVideoMetadata(userId, storagePath, metadata, key) {
+  const encryptedMetadata = await sealVideoMetadata(metadata, key);
+  const { error } = await supabase.from('vault_video_meta').upsert({
+    user_id: userId,
+    storage_path: storagePath,
+    encrypted_metadata: encryptedMetadata,
+  }, { onConflict: 'user_id,storage_path' });
+  if (error) throw new Error('Metadati cifrati non salvati: ' + error.message);
+}
+
+async function loadEncryptedVideoMetadata(userId, paths, key) {
+  if (!paths.length) return new Map();
+  const result = new Map();
+  for (let offset = 0; offset < paths.length; offset += 100) {
+    const batch = paths.slice(offset, offset + 100);
+    const { data, error } = await supabase.from('vault_video_meta')
+      .select('storage_path,encrypted_metadata')
+      .eq('user_id', userId)
+      .in('storage_path', batch);
+    if (error) throw new Error('Non riesco a leggere i metadati cifrati: ' + error.message);
+    for (const row of data || []) {
+      const metadata = await openVideoMetadata(row.encrypted_metadata, key);
+      if (metadata) result.set(row.storage_path, metadata);
+    }
+  }
+  return result;
+}
+
 function getOriginalVideoMime(name) {
   const match = name.replace(/\.vlt$/i, '').match(/\.([a-z0-9]+)$/i);
   const ext = match ? match[1].toLowerCase() : '';
@@ -467,6 +515,9 @@ function App() {
     } catch (listError) {
       setError('Non riesco a caricare i video da Backblaze: ' + listError.message);
     }
+    const metadataPaths = [
+      ...entries.map(item => item.path || (session.user.id + '/' + item.name)),
+    ];
     const b2Items = entries.map(item => {
       const path = item.path || (session.user.id + '/' + item.name);
       return {
@@ -528,9 +579,24 @@ function App() {
     } catch (driveError) {
       setGoogleDriveError(driveError.message || 'Google Drive non è momentaneamente disponibile.');
     }
+    const allItems = [...b2Items, ...driveRows];
+    const allMetadataPaths = allItems.map(item => item.path);
+    try {
+      const metadataMap = await loadEncryptedVideoMetadata(session.user.id, allMetadataPaths, vaultKey);
+      for (const item of allItems) {
+        const metadata = metadataMap.get(item.path);
+        if (metadata) {
+          item.displayName = metadata.name;
+          item.mime = metadata.mime;
+          item.encryptedMetadata = true;
+        }
+      }
+    } catch (metadataError) {
+      console.warn('Metadati cifrati non disponibili; uso i nomi legacy:', metadataError);
+    }
     setGoogleAccounts(connectedAccounts);
     setGoogleDriveQuota(driveQuotaResult);
-    setVideos([...b2Items, ...driveRows]);
+    setVideos(allItems);
 
     try {
       const quotaResult = await b2Request(session, { action: 'quota' });
@@ -895,19 +961,20 @@ function App() {
     const uploadedDriveItems = [];
     for (const file of selected) {
       setProgressName(file.name);
-      const safeName = file.name.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
-      const storedName = crypto.randomUUID() + '-' + safeName + '.vlt';
+      const storedName = crypto.randomUUID() + '.vlt';
       const path = session.user.id + '/Vault/' + storedName;
       try {
         const encrypted = await encryptVideo(file, vaultKey);
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
+          const drivePath = 'google:' + googleAccountId + ':' + saved.id;
+          await saveEncryptedVideoMetadata(session.user.id, drivePath, { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
           uploadedDriveItems.push({
             id: 'google-' + googleAccountId + '-' + saved.id,
             fileId: saved.id,
             accountId: googleAccountId,
             accountEmail: googleAccount.email,
-            path: 'google:' + googleAccountId + ':' + saved.id,
+            path: drivePath,
             name: saved.name || storedName,
             displayName: getDisplayName(saved.name || storedName),
             size: Number(saved.size || encrypted.size),
@@ -920,6 +987,7 @@ function App() {
           await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
         } else {
           await b2Upload(session, path, encrypted);
+          await saveEncryptedVideoMetadata(session.user.id, path, { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
           await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
         }
       } catch (uploadError) {
@@ -980,7 +1048,7 @@ function App() {
     const oldDisplay = renameItem.displayName || getDisplayName(renameItem.name);
     const extMatch = oldDisplay.match(/(\.[^.]+)$/);
     const extension = extMatch ? extMatch[1] : '';
-    const newName = crypto.randomUUID() + '-' + clean + extension + '.vlt';
+    const newName = crypto.randomUUID() + '.vlt';
     const newPath = renameItem.provider === 'google' ? renameItem.path : session.user.id + '/Vault/' + newName;
     setRenameBusy(true); setError('');
     try {
@@ -995,6 +1063,14 @@ function App() {
       return;
     }
     setRenameBusy(false);
+    try {
+      await saveEncryptedVideoMetadata(session.user.id, newPath, { name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
+      if (renameItem.path !== newPath) {
+        await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', renameItem.path);
+      }
+    } catch (metadataError) {
+      setError('Video rinominato, ma i metadati cifrati non sono stati aggiornati: ' + metadataError.message);
+    }
     const { error: sharesMoveError } = await supabase.from('vault_shares').update({ original_path: newPath, file_name: clean + extension }).eq('user_id', session.user.id).eq('original_path', renameItem.path).is('revoked_at', null);
     if (sharesMoveError) setError('Video rinominato, ma non ho aggiornato il collegamento dei link già creati: ' + sharesMoveError.message);
     await logActivity(session.user.id, 'video_renamed', clean, 'Video rinominato');
