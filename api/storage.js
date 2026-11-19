@@ -1,4 +1,5 @@
 import { createClient } from '@supabase/supabase-js';
+import { Readable } from 'node:stream';
 import { S3Client, ListObjectsV2Command, PutObjectCommand, GetObjectCommand, DeleteObjectsCommand, CopyObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 
@@ -66,6 +67,72 @@ export default async function handler(req, res) {
       const offset = Math.max(0, Number(body.offset) || 0);
       const limit = Math.min(1000, Math.max(1, Number(body.limit) || 100));
       return send(res, 200, { data: items.slice(offset, offset + limit) });
+    }
+
+    if (action === 'migrate') {
+      const sourceClient = createClient(process.env.VITE_SUPABASE_URL, process.env.VITE_SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { Authorization: 'Bearer ' + token } },
+      });
+      const copied = [];
+      const skipped = [];
+      const failures = [];
+      const pageSize = 100;
+      for (let offset = 0; ; offset += pageSize) {
+        const { data: page, error: listError } = await sourceClient.storage.from('vault-videos').list(userId, {
+          limit: pageSize, offset, sortBy: { column: 'created_at', order: 'asc' },
+        });
+        if (listError) throw new Error('Lettura elenco Supabase non riuscita: ' + listError.message);
+        const items = (page || []).filter(item => item?.name && item?.id);
+        for (const item of items) {
+          const key = safeKey(userId + '/' + item.name, userId);
+          const expectedSize = Number(item.metadata?.size || 0);
+          try {
+            let existing = null;
+            try {
+              existing = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+            } catch (headError) {
+              if (!(headError?.name === 'NotFound' || headError?.name === 'NoSuchKey' || headError?.$metadata?.httpStatusCode === 404)) throw headError;
+            }
+            if (existing) {
+              if (Number(existing.ContentLength) !== expectedSize) {
+                failures.push({ name: item.name, error: 'Esiste già una copia con dimensione diversa; file originale conservato.' });
+              } else {
+                skipped.push(item.name);
+              }
+              continue;
+            }
+            const { data: signed, error: signedError } = await sourceClient.storage.from('vault-videos').createSignedUrl(key, 300);
+            if (signedError || !signed?.signedUrl) throw new Error('Link di lettura Supabase non disponibile: ' + (signedError?.message || 'nessun URL'));
+            const sourceResponse = await fetch(signed.signedUrl);
+            if (!sourceResponse.ok || !sourceResponse.body) throw new Error('Download server-to-server da Supabase fallito (HTTP ' + sourceResponse.status + ').');
+            const sourceLength = Number(sourceResponse.headers.get('content-length') || expectedSize);
+            if (expectedSize && sourceLength !== expectedSize) throw new Error('Dimensione ricevuta da Supabase diversa da quella attesa.');
+            const bodyStream = Readable.fromWeb(sourceResponse.body);
+            await s3.send(new PutObjectCommand({
+              Bucket: bucket,
+              Key: key,
+              Body: bodyStream,
+              ContentLength: sourceLength,
+              ContentType: 'application/octet-stream',
+              CacheControl: 'no-store',
+            }));
+            const verified = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+            if (Number(verified.ContentLength) !== sourceLength) {
+              failures.push({ name: item.name, error: 'Verifica dimensionale Backblaze non superata; originale conservato.' });
+            } else {
+              copied.push(item.name);
+            }
+          } catch (itemError) {
+            failures.push({ name: item.name, error: itemError?.message || 'Errore sconosciuto' });
+          }
+        }
+        if (items.length < pageSize) break;
+      }
+      return send(res, failures.length ? 207 : 200, {
+        data: { copied, skipped, failures, total: copied.length + skipped.length + failures.length },
+        message: failures.length ? 'Copia parziale: gli originali su Supabase sono rimasti intatti.' : 'Copia completata e verificata. Gli originali su Supabase sono rimasti intatti.',
+      });
     }
 
     if (action === 'verify') {
