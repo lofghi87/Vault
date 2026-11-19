@@ -324,6 +324,7 @@ function App() {
   const [error, setError] = useState('');
   const [videos, setVideos] = useState([]);
   const [storageQuota, setStorageQuota] = useState(null);
+  const [googleDriveQuota, setGoogleDriveQuota] = useState(null);
   const [googleAccounts, setGoogleAccounts] = useState([]);
   const [storageDestination, setStorageDestination] = useState('backblaze');
   const [uploadDestinationOpen, setUploadDestinationOpen] = useState(false);
@@ -487,6 +488,7 @@ function App() {
       const accountsResult = await googleRequest(session, { action: 'accounts' });
       connectedAccounts = accountsResult.data || [];
       setGoogleDriveError('');
+      let driveQuotaResult = null;
       for (const account of connectedAccounts) {
         try {
           const listResult = await googleRequest(session, { action: 'list', accountId: account.id });
@@ -508,6 +510,13 @@ function App() {
               providerLabel: 'Google Drive · ' + account.email,
             }));
           driveRows.push(...accountFiles);
+          try {
+            const quota = await googleRequest(session, { action: 'quota', accountId: account.id });
+            driveQuotaResult = quota.data || null;
+            account.quotaError = '';
+          } catch (quotaError) {
+            account.quotaError = quotaError.message || 'Autorizzazione aggiuntiva necessaria per leggere lo spazio Drive.';
+          }
           account.status = 'connected';
           account.error = '';
         } catch (accountError) {
@@ -520,6 +529,7 @@ function App() {
       setGoogleDriveError(driveError.message || 'Google Drive non è momentaneamente disponibile.');
     }
     setGoogleAccounts(connectedAccounts);
+    setGoogleDriveQuota(driveQuotaResult);
     setVideos([...b2Items, ...driveRows]);
 
     try {
@@ -538,6 +548,7 @@ function App() {
       setVideos([]);
       setStorageQuota(null);
       setGoogleAccounts([]);
+      setGoogleDriveQuota(null);
       setGoogleDriveError('');
     }
   }, [session, vaultKey, loadVideos]);
@@ -802,7 +813,6 @@ function App() {
 
   async function connectGoogleDrive() {
     if (!session?.user?.id || googleConnectBusy) return;
-    if (googleAccounts.length > 0) { setGoogleDriveError('È già collegato un account Google. Scollegalo prima di aggiungerne un altro.'); return; }
     setGoogleConnectBusy(true);
     setGoogleDriveError('');
     try {
@@ -1348,8 +1358,9 @@ function App() {
       </section>
       <section className="stats">
         <div className="stat-card"><div className="stat-icon"><Film size={18}/></div><div><strong>{videos.length}</strong><span>Video archiviati</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? 2_000_000_000)}</strong><span>Spazio personale utilizzato</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><ShieldCheck size={18}/></div><div><strong>Privato</strong><span>Accesso personale</span></div></div>
+        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? 2_000_000_000)}</strong><span>Spazio Backblaze utilizzato</span></div></div>
+        <div className="stat-card"><div className="stat-icon"><Activity size={18}/></div><div><strong>{storageQuota ? formatSize(storageQuota.bucketUsedBytes || 0) : '—'}</strong><span>Spazio totale Backblaze · tutti i file</span></div></div>
+        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{googleDriveQuota?.availableBytes != null ? formatSize(googleDriveQuota.availableBytes) : '—'}</strong><span>Spazio disponibile su Google Drive</span></div></div>
       </section>
 
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
@@ -1399,6 +1410,7 @@ function App() {
                 <div className="storage-account-copy">
                   <b>{account.email}</b>
                   <span>{account.status === 'error' ? 'Connessione da ripristinare' : 'Cartella: Vault - video cifrati'}</span>
+                  {account.quotaError && <span className="storage-account-error">Per mostrare lo spazio totale, aggiorna le autorizzazioni Google.</span>}
                   {account.error && <span className="storage-account-error">{account.error}</span>}
                 </div>
                 <div className="storage-account-actions">
@@ -1409,6 +1421,8 @@ function App() {
             ))}
         </div>
         {googleDriveError && <div className="storage-error"><AlertCircle size={15}/><span>{googleDriveError}</span></div>}
+        {googleAccounts.some(account => account.quotaError) && <button className="secondary-share-btn" type="button" onClick={connectGoogleDrive} disabled={googleConnectBusy}>{googleConnectBusy ? <LoaderCircle className="spin" size={16}/> : <HardDrive size={16}/>} Aggiorna autorizzazioni Google Drive</button>}
+        {googleDriveQuota && <p className="storage-note">Google Drive: {formatSize(googleDriveQuota.usedBytes)} utilizzati su {googleDriveQuota.limitBytes == null ? 'spazio senza limite indicato' : formatSize(googleDriveQuota.limitBytes)} totali.</p>}
         <p className="storage-note">Puoi collegare un solo account Google alla volta. Per cambiarlo, scollega quello attuale e collega il nuovo. I video già presenti nel Drive non vengono eliminati.</p>
       </section>
       </div></div>}
