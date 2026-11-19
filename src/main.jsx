@@ -775,6 +775,19 @@ function App() {
         }
       }
 
+      const passphraseMetadata = await loadEncryptedVideoMetadata(
+        session.user.id,
+        allItems.map(item => item.path),
+        vaultKey
+      );
+      for (const item of allItems) {
+        const metadata = passphraseMetadata.get(item.path);
+        if (metadata) {
+          item.displayName = metadata.name;
+          item.mime = metadata.mime;
+        }
+      }
+
       if (!allItems.length) {
         setVaultKey(newKey);
         setCurrentVaultPassphrase('');
@@ -792,18 +805,20 @@ function App() {
           const plain = item.encrypted ? await decryptVideo(data, vaultKey, item.mime) : data;
           const encrypted = await encryptVideo(plain, newKey);
           await decryptVideo(encrypted, newKey, item.mime);
-          const safeName = item.displayName.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
-          const newName = crypto.randomUUID() + '-' + safeName + '.vlt';
+          const newName = crypto.randomUUID() + '.vlt';
 
           if (item.provider === 'google') {
             const saved = await googleUpload(session, item.accountId, newName, encrypted);
-            stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id });
+            const newMetadataPath = 'google:' + item.accountId + ':' + saved.id;
+            await saveEncryptedVideoMetadata(session.user.id, newMetadataPath, { name: item.displayName, mime: item.mime }, newKey);
+            stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id, metadataPath: newMetadataPath });
             const savedCopy = await googleDownload(session, item.accountId, saved.id, saved.size);
             await decryptVideo(savedCopy, newKey, item.mime);
           } else {
             const newPath = session.user.id + '/Vault/' + newName;
             await b2Upload(session, newPath, encrypted);
-            stagedItems.push({ provider: 'backblaze', path: newPath });
+            await saveEncryptedVideoMetadata(session.user.id, newPath, { name: item.displayName, mime: item.mime }, newKey);
+            stagedItems.push({ provider: 'backblaze', path: newPath, metadataPath: newPath });
             const savedCopy = await b2Download(session, newPath);
             await decryptVideo(savedCopy, newKey, item.mime);
           }
@@ -813,6 +828,7 @@ function App() {
         replacementStarted = true;
         const oldB2Paths = allItems.filter(item => item.provider === 'backblaze').map(item => item.path);
         if (oldB2Paths.length) await b2Delete(session, oldB2Paths);
+        if (oldB2Paths.length) await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).in('storage_path', oldB2Paths);
         for (const account of accounts) {
           const oldGoogleIds = allItems
             .filter(item => item.provider === 'google' && item.accountId === account.id)
@@ -820,6 +836,8 @@ function App() {
           for (const fileId of oldGoogleIds) {
             await googleRequest(session, { action: 'delete', accountId: account.id, fileId });
           }
+          const oldGooglePaths = allItems.filter(item => item.provider === 'google' && item.accountId === account.id).map(item => item.path);
+          if (oldGooglePaths.length) await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).in('storage_path', oldGooglePaths);
         }
         setVaultKey(newKey);
         setSettingsOpen(false);
@@ -837,8 +855,10 @@ function App() {
           try {
             if (item.provider === 'google') {
               await googleRequest(session, { action: 'delete', accountId: item.accountId, fileId: item.fileId });
+              if (item.metadataPath) await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', item.metadataPath);
             } else {
               await b2Delete(session, [item.path]);
+              if (item.metadataPath) await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', item.metadataPath);
             }
           } catch (cleanupError) {
             console.error('Pulizia della copia temporanea non riuscita:', cleanupError);
