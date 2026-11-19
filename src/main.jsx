@@ -22,7 +22,7 @@ async function b2ListAll(session) {
   return all;
 }
 async function b2Download(session,path){ const r=await b2Request(session,{action:'downloadUrl',path}); const response=await fetch(r.url); if(!response.ok) throw new Error('Download Backblaze non riuscito (HTTP '+response.status+').'); return response.blob(); }
-async function b2Upload(session,path,blob){ const r=await b2Request(session,{action:'uploadUrl',path}); const response=await fetch(r.url,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:blob}); if(!response.ok) throw new Error('Caricamento Backblaze non riuscito (HTTP '+response.status+').'); const v=await b2Request(session,{action:'verify',path}); if(Number(v.data?.size)!==blob.size) throw new Error('Verifica dimensionale Backblaze non riuscita.'); }
+async function b2Upload(session,path,blob){ const r=await b2Request(session,{action:'uploadUrl',path,size:blob.size}); const response=await fetch(r.url,{method:'PUT',headers:{'Content-Type':'application/octet-stream'},body:blob}); if(!response.ok) throw new Error('Caricamento Backblaze non riuscito (HTTP '+response.status+').'); const v=await b2Request(session,{action:'verify',path,expectedSize:blob.size}); if(Number(v.data?.size)!==blob.size) throw new Error('Verifica dimensionale Backblaze non riuscita.'); }
 async function b2Delete(session,paths){ if(paths?.length) await b2Request(session,{action:'delete',paths}); }
 async function b2DeleteShareCopies(session, paths) {
   if (!paths?.length) return;
@@ -161,6 +161,7 @@ function App() {
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
   const [videos, setVideos] = useState([]);
+  const [storageQuota, setStorageQuota] = useState(null);
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [uploading, setUploading] = useState(false);
   const [progressName, setProgressName] = useState('');
@@ -279,12 +280,22 @@ function App() {
       return { ...item, path, encrypted: item.name.endsWith('.vlt'), displayName: getDisplayName(item.name), size: item.metadata?.size || 0, mime: item.name.endsWith('.vlt') ? getOriginalVideoMime(item.name) : (item.metadata?.mimetype || '') };
     });
     setVideos(withUrls);
+    try {
+      const quotaResult = await b2Request(session, { action: 'quota' });
+      setStorageQuota(quotaResult.data || null);
+    } catch (quotaError) {
+      console.warn('Contatore spazio Vault non aggiornato:', quotaError);
+      setStorageQuota(null);
+    }
     setLoadingVideos(false);
   }, [session, vaultKey]);
 
   useEffect(() => {
     if (session && vaultKey) loadVideos();
-    else setVideos([]);
+    else {
+      setVideos([]);
+      setStorageQuota(null);
+    }
   }, [session, vaultKey, loadVideos]);
 
   useEffect(() => {
@@ -801,7 +812,11 @@ function App() {
     });
   }, [notificationsEnabled, shares, nowTick]);
   const totalBytes = videos.reduce((sum, item) => sum + item.size, 0);
-  const formatSize = bytes => bytes < 1024 * 1024 ? (bytes / 1024).toFixed(0) + ' KB' : (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+  const formatSize = bytes => bytes < 1024 * 1024
+    ? (bytes / 1024).toFixed(0) + ' KB'
+    : bytes < 1024 * 1024 * 1024
+      ? (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+      : (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
   const formatDate = value => value ? new Date(value).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
   if (incomingShare) return (
@@ -877,7 +892,7 @@ function App() {
       </section>
       <section className="stats">
         <div className="stat-card"><div className="stat-icon"><Film size={18}/></div><div><strong>{videos.length}</strong><span>Video archiviati</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(totalBytes)} / 10 GB</strong><span>Spazio disponibile</span></div></div>
+        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? (2 * 1024 * 1024 * 1024))}</strong><span>Spazio personale utilizzato</span></div></div>
         <div className="stat-card"><div className="stat-icon"><ShieldCheck size={18}/></div><div><strong>Privato</strong><span>Accesso personale</span></div></div>
       </section>
 
