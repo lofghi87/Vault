@@ -323,6 +323,7 @@ export default async function handler(req, res) {
       const usage = await getBucketUsage(userId);
       return send(res, 200, { data: {
         usedBytes: usage.userBytes,
+        bucketUsedBytes: usage.totalBytes,
         personalLimitBytes: PERSONAL_QUOTA_BYTES,
       } });
     }
