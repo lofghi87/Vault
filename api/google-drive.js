@@ -1,7 +1,7 @@
 import { Readable } from 'node:stream';
 import {
   googleConfigReady, requireUser, getGoogleAccount, getGoogleAccessToken,
-  googleApi, startGoogleOAuth, listGoogleFiles,
+  decryptRefreshToken, googleApi, startGoogleOAuth, listGoogleFiles,
 } from './_google-drive.js';
 
 function send(res, status, body) {
@@ -24,6 +24,11 @@ export default async function handler(req, res) {
       const fileId = String(req.query.fileId || '');
       if (!fileId || fileId.includes('/')) return send(res, 400, { error: 'File Google Drive non valido.' });
       const accessToken = await getGoogleAccessToken(admin, account);
+      const metadataResponse = await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId) + '?fields=id,parents');
+      const metadata = await metadataResponse.json().catch(() => ({}));
+      if (!metadataResponse.ok || !(metadata.parents || []).includes(account.folder_id)) {
+        return send(res, 404, { error: 'Video non trovato nella cartella Vault di questo account.' });
+      }
       const driveResponse = await googleApi(accessToken, '/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media');
       if (!driveResponse.ok || !driveResponse.body) return send(res, driveResponse.status || 502, { error: 'Non riesco a scaricare il video cifrato da Google Drive.' });
       res.status(200);
@@ -156,14 +161,13 @@ export default async function handler(req, res) {
 
     if (action === 'disconnect') {
       const account = await getGoogleAccount(admin, user.id, req.body.accountId);
-      const refreshToken = (await import('node:crypto')).createHash ? null : null;
       let revokeResult = null;
       try {
-        const accessToken = await getGoogleAccessToken(admin, account);
+        const refreshToken = decryptRefreshToken(account.refresh_token_enc);
         revokeResult = await fetch('https://oauth2.googleapis.com/revoke', {
           method: 'POST',
           headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-          body: new URLSearchParams({ token: accessToken }),
+          body: new URLSearchParams({ token: refreshToken }),
         });
       } catch (revokeError) {
         console.warn('[Vault Google Drive] revoke failed during disconnect:', revokeError.message);
