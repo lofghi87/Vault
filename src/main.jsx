@@ -666,7 +666,7 @@ function App() {
     setSecurityLoading(true);
     const [shareResult, activityResult] = await Promise.all([
       supabase.from('vault_shares').select('*').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit(50),
-      supabase.from('vault_activity').select('id,event_type,item_name,details,created_at').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit((40)
+      supabase.from('vault_activity').select('id,event_type,item_name,details,created_at').eq('user_id', session.user.id).order('created_at', { ascending: false }).limit(40)
     ]);
     if (shareResult.error || activityResult.error) {
       setError('Non riesco a caricare il centro sicurezza: ' + (shareResult.error || activityResult.error).message);
