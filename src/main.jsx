@@ -486,8 +486,26 @@ function App() {
         const first = failures[0];
         throw new Error('Copiati: ' + copied.length + ', già presenti: ' + skipped.length + '. Problema con ' + (first.name || 'un file') + ': ' + (first.error || 'errore sconosciuto') + '. Gli originali su Supabase sono rimasti intatti.');
       }
-      setMessage('Backup completato e verificato: ' + copied.length + ' video copiati, ' + skipped.length + ' già presenti su Backblaze. Gli originali su Supabase sono rimasti intatti.');
-      await logActivity(session.user.id, 'other', null, 'Backup Backblaze verificato: ' + copied.length + ' copiati, ' + skipped.length + ' già presenti');
+      setMigrationProgress('Controllo integrità SHA-256 di ogni video…');
+      const verifyResponse = await fetch('/api/storage', {
+        method: 'POST',
+        headers: {
+          Authorization: 'Bearer ' + session.access_token,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({ action: 'verifyMigration' }),
+      });
+      const verification = await verifyResponse.json().catch(() => ({}));
+      if (!verifyResponse.ok && verifyResponse.status !== 207) {
+        throw new Error(verification.error || 'Verifica integrità non riuscita (HTTP ' + verifyResponse.status + ').');
+      }
+      const verificationSummary = verification.summary || {};
+      if (verificationSummary.failures || verificationSummary.verified !== verificationSummary.scanned) {
+        const first = verification.data?.failures?.[0];
+        throw new Error('Verificati con SHA-256: ' + (verificationSummary.verified || 0) + '/' + (verificationSummary.scanned || 0) + '. ' + (first?.name ? first.name + ': ' : '') + (first?.error || 'almeno un file non è stato verificato') + '. Gli originali su Supabase sono rimasti intatti.');
+      }
+      setMessage('Backup integro: ' + verificationSummary.verified + ' video verificati byte per byte (SHA-256). ' + copied.length + ' copiati ora, ' + skipped.length + ' già presenti su Backblaze. Gli originali su Supabase sono rimasti intatti.');
+      await logActivity(session.user.id, 'other', null, 'Backup Backblaze verificato con SHA-256: ' + verificationSummary.verified + ' file');
     } catch (e) {
       setError('Backup su Backblaze non completato: ' + (e.message || 'errore sconosciuto') + ' Nessun originale su Supabase è stato eliminato.');
     } finally {
