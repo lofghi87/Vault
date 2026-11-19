@@ -20,6 +20,39 @@ function send(res, status, body) {
   res.status(status).json(body);
 }
 
+const PERSONAL_QUOTA_BYTES = 2 * 1024 * 1024 * 1024;
+const GLOBAL_SAFE_LIMIT_BYTES = 8 * 1024 * 1024 * 1024;
+
+// Counts all current objects, including temporary share copies, across the bucket.
+async function getBucketUsage(userId) {
+  let totalBytes = 0;
+  let userBytes = 0;
+  let continuationToken;
+  do {
+    const result = await s3.send(new ListObjectsV2Command({
+      Bucket: bucket,
+      MaxKeys: 1000,
+      ...(continuationToken ? { ContinuationToken: continuationToken } : {}),
+    }));
+    for (const item of result.Contents || []) {
+      const size = Number(item.Size || 0);
+      totalBytes += size;
+      if (item.Key?.startsWith(userId + '/')) userBytes += size;
+    }
+    if (!result.IsTruncated) break;
+    if (!result.NextContinuationToken) throw new Error('Paginazione dello spazio Backblaze incompleta.');
+    continuationToken = result.NextContinuationToken;
+  } while (true);
+  return { totalBytes, userBytes };
+}
+
+async function deleteObject(key) {
+  await s3.send(new DeleteObjectsCommand({
+    Bucket: bucket,
+    Delete: { Objects: [{ Key: key }], Quiet: true },
+  }));
+}
+
 function safeKey(value, userId) {
   if (typeof value !== 'string' || !value || value.startsWith('/') || value.includes('..') || value.includes('\\')) {
     throw new Error('Percorso file non valido.');
@@ -279,11 +312,34 @@ export default async function handler(req, res) {
       });
     }
 
+    if (action === 'quota') {
+      const usage = await getBucketUsage(userId);
+      return send(res, 200, { data: {
+        usedBytes: usage.userBytes,
+        personalLimitBytes: PERSONAL_QUOTA_BYTES,
+      } });
+    }
+
     if (action === 'verify') {
       const key = safeKey(body.path, userId);
       try {
         const result = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
-        return send(res, 200, { data: { size: result.ContentLength || 0, etag: result.ETag || null } });
+        const actualSize = Number(result.ContentLength || 0);
+        const expectedSize = Number(body.expectedSize || 0);
+        if (expectedSize > 0 && actualSize !== expectedSize) {
+          await deleteObject(key);
+          return send(res, 422, { error: 'La dimensione caricata non coincide con quella prevista. Il file incompleto è stato rimosso.' });
+        }
+        const usage = await getBucketUsage(userId);
+        if (usage.userBytes > PERSONAL_QUOTA_BYTES || usage.totalBytes > GLOBAL_SAFE_LIMIT_BYTES) {
+          await deleteObject(key);
+          return send(res, usage.userBytes > PERSONAL_QUOTA_BYTES ? 413 : 507, {
+            error: usage.userBytes > PERSONAL_QUOTA_BYTES
+              ? 'Hai superato lo spazio personale di 2 GB. Il nuovo caricamento è stato annullato.'
+              : 'Vault ha raggiunto il limite di sicurezza dello spazio condiviso. Il nuovo caricamento è stato annullato.',
+          });
+        }
+        return send(res, 200, { data: { size: actualSize, etag: result.ETag || null } });
       } catch (error) {
         if (error?.name === 'NotFound' || error?.name === 'NoSuchKey' || error?.$metadata?.httpStatusCode === 404) {
           return send(res, 404, { error: 'File non presente su Backblaze.' });
@@ -294,6 +350,26 @@ export default async function handler(req, res) {
 
     if (action === 'uploadUrl') {
       const key = safeKey(body.path, userId);
+      const requestedSize = Number(body.size);
+      if (!Number.isSafeInteger(requestedSize) || requestedSize <= 0) {
+        return send(res, 400, { error: 'Dimensione del caricamento non valida.' });
+      }
+      if (requestedSize > PERSONAL_QUOTA_BYTES) {
+        return send(res, 413, { error: 'Il singolo video supera lo spazio massimo di 2 GB del tuo account.' });
+      }
+      try {
+        await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: key }));
+        return send(res, 409, { error: 'Esiste già un file con questo percorso. Riprova il caricamento.' });
+      } catch (headError) {
+        if (!(headError?.name === 'NotFound' || headError?.name === 'NoSuchKey' || headError?.$metadata?.httpStatusCode === 404)) throw headError;
+      }
+      const usage = await getBucketUsage(userId);
+      if (usage.userBytes + requestedSize > PERSONAL_QUOTA_BYTES) {
+        return send(res, 413, { error: 'Hai esaurito i 2 GB di spazio personale. Elimina un video per liberare spazio.' });
+      }
+      if (usage.totalBytes + requestedSize > GLOBAL_SAFE_LIMIT_BYTES) {
+        return send(res, 507, { error: 'Lo spazio disponibile di Vault è temporaneamente esaurito. I tuoi video restano accessibili, ma per ora non è possibile caricarne altri.' });
+      }
       const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: 'application/octet-stream', CacheControl: 'no-store' });
       const url = await getSignedUrl(s3, command, { expiresIn: 300 });
       return send(res, 200, { url });
@@ -319,6 +395,23 @@ export default async function handler(req, res) {
     if (action === 'copy' || action === 'move') {
       const source = safeKey(body.from, userId);
       const destination = safeKey(body.to, userId);
+      const sourceHead = await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: source }));
+      const sourceSize = Number(sourceHead.ContentLength || 0);
+      if (action === 'copy') {
+        try {
+          await s3.send(new HeadObjectCommand({ Bucket: bucket, Key: destination }));
+          return send(res, 409, { error: 'La destinazione esiste già.' });
+        } catch (headError) {
+          if (!(headError?.name === 'NotFound' || headError?.name === 'NoSuchKey' || headError?.$metadata?.httpStatusCode === 404)) throw headError;
+        }
+        const usage = await getBucketUsage(userId);
+        if (usage.userBytes + sourceSize > PERSONAL_QUOTA_BYTES) {
+          return send(res, 413, { error: 'Non c’è abbastanza spazio personale per creare una copia temporanea di condivisione.' });
+        }
+        if (usage.totalBytes + sourceSize > GLOBAL_SAFE_LIMIT_BYTES) {
+          return send(res, 507, { error: 'Lo spazio condiviso di Vault è temporaneamente esaurito: non è possibile creare altre copie di condivisione.' });
+        }
+      }
       await s3.send(new CopyObjectCommand({
         Bucket: bucket,
         Key: destination,
@@ -327,6 +420,14 @@ export default async function handler(req, res) {
       }));
       if (action === 'move') {
         await s3.send(new DeleteObjectsCommand({ Bucket: bucket, Delete: { Objects: [{ Key: source }], Quiet: true } }));
+      } else {
+        const afterCopy = await getBucketUsage(userId);
+        if (afterCopy.userBytes > PERSONAL_QUOTA_BYTES || afterCopy.totalBytes > GLOBAL_SAFE_LIMIT_BYTES) {
+          await deleteObject(destination);
+          return send(res, afterCopy.userBytes > PERSONAL_QUOTA_BYTES ? 413 : 507, {
+            error: 'La copia temporanea supererebbe il limite di spazio di Vault. Non è stata conservata.',
+          });
+        }
       }
       return send(res, 200, { data: { path: destination } });
     }
