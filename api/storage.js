@@ -219,6 +219,66 @@ export default async function handler(req, res) {
       });
     }
 
+    if (action === 'purgeSupabaseVerified') {
+      const sourceClient = createClient(process.env.VITE_SUPABASE_URL, process.env.VITE_SUPABASE_ANON_KEY, {
+        auth: { persistSession: false, autoRefreshToken: false },
+        global: { headers: { Authorization: 'Bearer ' + token } },
+      });
+      const paths = [];
+      const failures = [];
+      let scanned = 0;
+      const pageSize = 100;
+      for (let offset = 0; ; offset += pageSize) {
+        const { data: page, error: listError } = await sourceClient.storage.from('vault-videos').list(userId, {
+          limit: pageSize, offset, sortBy: { column: 'created_at', order: 'asc' },
+        });
+        if (listError) throw new Error('Lettura elenco Supabase non riuscita: ' + listError.message);
+        const items = (page || []).filter(item => item?.name && item?.id);
+        scanned += items.length;
+        for (const item of items) {
+          const key = safeKey(userId + '/' + item.name, userId);
+          try {
+            const { data: signed, error: signedError } = await sourceClient.storage.from('vault-videos').createSignedUrl(key, 300);
+            if (signedError || !signed?.signedUrl) throw new Error('Link Supabase non disponibile: ' + (signedError?.message || 'nessun URL'));
+            const sourceResponse = await fetch(signed.signedUrl);
+            if (!sourceResponse.ok || !sourceResponse.body) throw new Error('Lettura originale Supabase fallita (HTTP ' + sourceResponse.status + ').');
+            const sourceHash = await sha256Stream(Readable.fromWeb(sourceResponse.body));
+            const target = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+            if (!target.Body) throw new Error('Copia assente su Backblaze.');
+            const targetHash = await sha256Stream(target.Body);
+            if (sourceHash.size !== targetHash.size || sourceHash.sha256 !== targetHash.sha256) {
+              throw new Error('SHA-256 o dimensione diversi: originale mantenuto.');
+            }
+            paths.push(key);
+          } catch (itemError) {
+            failures.push({ name: item.name, error: itemError?.message || 'Errore di verifica sconosciuto.' });
+          }
+        }
+        if (items.length < pageSize) break;
+      }
+      if (failures.length || paths.length !== scanned) {
+        console.warn('[Vault Supabase cleanup] aborted; originals retained', { userId, scanned, verified: paths.length, failures: failures.length });
+        return send(res, 409, {
+          error: 'Pulizia annullata: non tutti i file hanno superato la verifica SHA-256. Nessun originale è stato eliminato.',
+          summary: { scanned, verified: paths.length, failures },
+        });
+      }
+      for (let offset = 0; offset < paths.length; offset += 100) {
+        const batch = paths.slice(offset, offset + 100);
+        const { data: removed, error: removeError } = await sourceClient.storage.from('vault-videos').remove(batch);
+        if (removeError) throw new Error('Verifica completata, ma Supabase non ha consentito la rimozione di un gruppo di file: ' + removeError.message);
+        if (!Array.isArray(removed) || removed.length !== batch.length) {
+          throw new Error('Supabase non ha confermato la rimozione di tutti i file del gruppo. Verificare lo stato dello storage.');
+        }
+      }
+      console.info('[Vault Supabase cleanup] completed', { userId, scanned, verified: paths.length, removed: paths.length });
+      return send(res, 200, {
+        data: { removed: paths },
+        summary: { scanned, verified: paths.length, removed: paths.length },
+        message: 'Originali Supabase rimossi solo dopo verifica SHA-256 identica su Backblaze.',
+      });
+    }
+
     if (action === 'verify') {
       const key = safeKey(body.path, userId);
       try {
