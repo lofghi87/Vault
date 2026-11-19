@@ -813,11 +813,11 @@ function App() {
     });
   }, [notificationsEnabled, shares, nowTick]);
   const totalBytes = videos.reduce((sum, item) => sum + item.size, 0);
-  const formatSize = bytes => bytes < 1024 * 1024
-    ? (bytes / 1024).toFixed(0) + ' KB'
-    : bytes < 1024 * 1024 * 1024
-      ? (bytes / (1024 * 1024)).toFixed(1) + ' MB'
-      : (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  const formatSize = bytes => bytes < 1_000_000
+    ? (bytes / 1_000).toFixed(0) + ' KB'
+    : bytes < 1_000_000_000
+      ? (bytes / 1_000_000).toFixed(1) + ' MB'
+      : (bytes / 1_000_000_000).toFixed(2) + ' GB';
   const formatDate = value => value ? new Date(value).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
   if (incomingShare) return (
@@ -893,7 +893,7 @@ function App() {
       </section>
       <section className="stats">
         <div className="stat-card"><div className="stat-icon"><Film size={18}/></div><div><strong>{videos.length}</strong><span>Video archiviati</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? (2 * 1024 * 1024 * 1024))}</strong><span>Spazio personale utilizzato</span></div></div>
+        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? 2_000_000_000)}</strong><span>Spazio personale utilizzato</span></div></div>
         <div className="stat-card"><div className="stat-icon"><ShieldCheck size={18}/></div><div><strong>Privato</strong><span>Accesso personale</span></div></div>
       </section>
 
