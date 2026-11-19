@@ -274,6 +274,19 @@ function App() {
   }, []);
 
   useEffect(() => {
+    const params = new URLSearchParams(window.location.search);
+    const driveStatus = params.get('drive');
+    const driveError = params.get('drive_error');
+    if (driveStatus === 'connected') {
+      setMessage('Account Google Drive collegato. Ora puoi sceglierlo come destinazione dei nuovi video.');
+    }
+    if (driveError) setError(driveError);
+    if (driveStatus || driveError) {
+      window.history.replaceState({}, '', window.location.pathname + window.location.hash);
+    }
+  }, []);
+
+  useEffect(() => {
     supabase.auth.getSession().then(({ data }) => {
       setSession(data.session);
       setAuthReady(true);
@@ -579,6 +592,41 @@ function App() {
   }
 
 
+  async function connectGoogleDrive() {
+    if (!session?.user?.id || googleConnectBusy) return;
+    setGoogleConnectBusy(true);
+    setGoogleDriveError('');
+    try {
+      const result = await googleRequest(session, { action: 'connect' });
+      if (!result.url) throw new Error('Google non ha restituito il link di autorizzazione.');
+      window.location.assign(result.url);
+    } catch (connectError) {
+      setGoogleDriveError(connectError.message || 'Non riesco ad avviare il collegamento Google.');
+      setGoogleConnectBusy(false);
+    }
+  }
+
+  async function disconnectGoogleDrive(account) {
+    if (!account?.id || googleDisconnectId) return;
+    const confirmed = window.confirm(
+      'Vuoi scollegare ' + account.email + ' da Vault? I video resteranno nel suo Google Drive, ma non saranno più visibili in Vault finché non ricollegherai lo stesso account.'
+    );
+    if (!confirmed) return;
+    setGoogleDisconnectId(account.id);
+    setGoogleDriveError('');
+    try {
+      await googleRequest(session, { action: 'disconnect', accountId: account.id });
+      setGoogleAccounts(current => current.filter(row => row.id !== account.id));
+      if (storageDestination === 'google:' + account.id) setStorageDestination('backblaze');
+      setMessage('Account Google scollegato. I file originali sono rimasti nel Google Drive.');
+      await loadVideos();
+    } catch (disconnectError) {
+      setGoogleDriveError(disconnectError.message || 'Non riesco a scollegare l’account Google.');
+    } finally {
+      setGoogleDisconnectId('');
+    }
+  }
+
   async function handleUpload(event) {
     const selected = Array.from(event.target.files || []);
     event.target.value = '';
@@ -589,16 +637,34 @@ function App() {
       return;
     }
     if (!vaultKey) { setError('Sblocca prima la cassaforte con la tua frase segreta.'); return; }
+    const isGoogleDestination = storageDestination.startsWith('google:');
+    const googleAccountId = isGoogleDestination ? storageDestination.slice('google:'.length) : '';
+    const googleAccount = isGoogleDestination ? googleAccounts.find(account => account.id === googleAccountId) : null;
+    if (isGoogleDestination && !googleAccount) {
+      setError('Seleziona un account Google Drive collegato e disponibile.');
+      return;
+    }
+    if (isGoogleDestination && googleAccount.status === 'error') {
+      setError('Questo account Google deve essere ricollegato prima di poter caricare video.');
+      return;
+    }
+
     setUploading(true);
     setError('');
     for (const file of selected) {
       setProgressName(file.name);
       const safeName = file.name.normalize('NFKD').replace(/[^a-zA-Z0-9._-]/g, '-').replace(/-+/g, '-').slice(-100) || 'video';
-      const path = session.user.id + '/' + crypto.randomUUID() + '-' + safeName + '.vlt';
+      const storedName = crypto.randomUUID() + '-' + safeName + '.vlt';
+      const path = session.user.id + '/' + storedName;
       try {
         const encrypted = await encryptVideo(file, vaultKey);
-        await b2Upload(session, path, encrypted);
-        await logActivity(session.user.id, 'video_uploaded', file.name, 'Video caricato e cifrato sul dispositivo');
+        if (isGoogleDestination) {
+          await googleUpload(session, googleAccountId, storedName, encrypted);
+          await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
+        } else {
+          await b2Upload(session, path, encrypted);
+          await logActivity(session.user.id, 'video_uploaded', file.name, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
+        }
       } catch (uploadError) {
         setError('Errore durante la cifratura o il caricamento di ' + file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
         break;
