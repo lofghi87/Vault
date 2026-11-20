@@ -413,6 +413,7 @@ function App() {
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [activeSection, setActiveSection] = useState('gallery');
   const [dataUpdatedAt, setDataUpdatedAt] = useState(null);
+  const [loadedVaultKey, setLoadedVaultKey] = useState(null);
   const [trashOpen, setTrashOpen] = useState(false);
   const [trashActionId, setTrashActionId] = useState('');
   const [integrityChecking, setIntegrityChecking] = useState(false);
@@ -655,6 +656,7 @@ function App() {
       setStorageQuota(null);
     }
     setDataUpdatedAt(new Date().toISOString());
+    setLoadedVaultKey(vaultKey);
     setLoadingVideos(false);
   }, [session, vaultKey]);
 
@@ -1840,7 +1842,7 @@ function App() {
   }, [session?.user?.id, vaultKey]);
 
   useEffect(() => {
-    if (!session?.user?.id || !vaultKey || incomingShare || !dataUpdatedAt || loadingVideos || !videos.length ||
+    if (!session?.user?.id || !vaultKey || loadedVaultKey !== vaultKey || incomingShare || !dataUpdatedAt || loadingVideos || !videos.length ||
         uploading || rotationBusy || metadataMigrationBusy || integrityChecking ||
         trashActionId || renameBusy || automaticIntegrityStartedRef.current) return;
 
@@ -1916,7 +1918,7 @@ function App() {
       if (started) setIntegrityChecking(false);
       setIntegrityProgress('');
     };
-  }, [session?.user?.id, vaultKey, loadingVideos, dataUpdatedAt, incomingShare]);
+  }, [session?.user?.id, vaultKey, loadingVideos, dataUpdatedAt, loadedVaultKey, incomingShare]);
 
   if (incomingShare) return (
     <main className="auth-page incoming-share-page">
