@@ -362,3 +362,14 @@ button,input{min-width:0}
   .integrity-summary-grid{grid-template-columns:repeat(2,minmax(0,1fr))}
   .integrity-result-row{align-items:flex-start;flex-direction:column}
 }
+
+
+/* Keep the settings back button in the document flow, above the section icon. */
+.settings-detail-modal > .modal-back-btn,
+.account-modal > .modal-back-btn,
+.security-modal > .modal-back-btn,
+.settings-modal > .modal-back-btn {
+  position: relative;
+  inset: auto;
+  margin: 0 0 16px;
+}
