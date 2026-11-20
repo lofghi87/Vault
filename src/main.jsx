@@ -242,7 +242,7 @@ async function openVideoMetadata(value, key) {
     const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: packed.slice(0, 12) }, key, packed.slice(12));
     const parsed = JSON.parse(new TextDecoder().decode(plain));
     if (typeof parsed.name !== 'string' || typeof parsed.mime !== 'string') return null;
-    return { name: parsed.name, mime: parsed.mime };
+    return parsed;
   } catch {
     return null;
   }
@@ -256,6 +256,66 @@ async function saveEncryptedVideoMetadata(userId, storagePath, metadata, key) {
     encrypted_metadata: encryptedMetadata,
   }, { onConflict: 'user_id,storage_path' });
   if (error) throw new Error('Metadati cifrati non salvati: ' + error.message);
+}
+
+async function updateEncryptedVideoMetadata(userId, storagePath, key, fallbackMetadata, updateMetadata) {
+  const maxAttempts = 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { data: row, error: readError } = await supabase
+      .from('vault_video_meta')
+      .select('encrypted_metadata')
+      .eq('user_id', userId)
+      .eq('storage_path', storagePath)
+      .maybeSingle();
+    if (readError) throw new Error('Non riesco a leggere i metadati cifrati: ' + readError.message);
+
+    let currentMetadata = fallbackMetadata;
+    const rowExists = Boolean(row);
+    const previousCiphertext = row?.encrypted_metadata ?? null;
+    if (rowExists) {
+      if (typeof previousCiphertext !== 'string' || !previousCiphertext) {
+        throw new Error('Esiste una riga di metadati senza contenuto cifrato. Non la sovrascrivo automaticamente.');
+      }
+      currentMetadata = await openVideoMetadata(previousCiphertext, key);
+      if (!currentMetadata) {
+        throw new Error('I metadati cifrati non sono leggibili con la chiave attuale. Non li sovrascrivo per evitare di perdere il titolo originale.');
+      }
+    }
+
+    const nextMetadata = await updateMetadata({ ...currentMetadata });
+    if (!nextMetadata || typeof nextMetadata.name !== 'string' || typeof nextMetadata.mime !== 'string') {
+      throw new Error('Aggiornamento metadati non valido.');
+    }
+    const encryptedMetadata = await sealVideoMetadata(nextMetadata, key);
+
+    if (rowExists) {
+      const { data: updatedRow, error: updateError } = await supabase
+        .from('vault_video_meta')
+        .update({ encrypted_metadata: encryptedMetadata })
+        .eq('user_id', userId)
+        .eq('storage_path', storagePath)
+        .eq('encrypted_metadata', previousCiphertext)
+        .select('storage_path')
+        .maybeSingle();
+      if (updateError) throw new Error('Metadati cifrati non aggiornati: ' + updateError.message);
+      if (updatedRow) return nextMetadata;
+    } else {
+      const { data: insertedRow, error: insertError } = await supabase
+        .from('vault_video_meta')
+        .insert({
+          user_id: userId,
+          storage_path: storagePath,
+          encrypted_metadata: encryptedMetadata,
+        })
+        .select('storage_path')
+        .maybeSingle();
+      if (!insertError && insertedRow) return nextMetadata;
+      if (insertError && insertError.code !== '23505') {
+        throw new Error('Metadati cifrati non salvati: ' + insertError.message);
+      }
+    }
+  }
+  throw new Error('I metadati sono stati modificati contemporaneamente su un altro dispositivo. Aggiorna la libreria e riprova.');
 }
 
 async function loadEncryptedVideoMetadata(userId, paths, key) {
@@ -413,6 +473,13 @@ function App() {
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [activeSection, setActiveSection] = useState('gallery');
   const [dataUpdatedAt, setDataUpdatedAt] = useState(null);
+  const [loadedVaultKey, setLoadedVaultKey] = useState(null);
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [trashActionId, setTrashActionId] = useState('');
+  const [integrityChecking, setIntegrityChecking] = useState(false);
+  const [integrityProgress, setIntegrityProgress] = useState('');
+  const [integrityResults, setIntegrityResults] = useState([]);
+  const [integrityRunAt, setIntegrityRunAt] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [progressName, setProgressName] = useState('');
   const [shareItem, setShareItem] = useState(null);
@@ -465,6 +532,8 @@ function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted');
   const [nowTick, setNowTick] = useState(() => Date.now());
   const notifiedShareIds = useRef(new Set());
+  const automaticIntegrityStartedRef = useRef(false);
+  const automaticIntegrityTimerRef = useRef(null);
   const videoElementRef = useRef(null);
   const uploadInputRef = useRef(null);
   const uploadDestinationRef = useRef('backblaze');
@@ -624,6 +693,12 @@ function App() {
           item.displayName = metadata.name;
           item.mime = metadata.mime;
           item.encryptedMetadata = true;
+          item.vaultMetadata = metadata;
+          item.trashedAt = typeof metadata.trashedAt === 'string' ? metadata.trashedAt : null;
+          item.integritySha256 = typeof metadata.integritySha256 === 'string' ? metadata.integritySha256 : '';
+          item.integritySize = Number(metadata.integritySize || 0);
+          item.integrityLastStatus = metadata.integrityLastStatus || 'pending';
+          item.integrityLastCheckedAt = metadata.integrityLastCheckedAt || null;
         }
       }
     } catch (metadataError) {
@@ -641,6 +716,7 @@ function App() {
       setStorageQuota(null);
     }
     setDataUpdatedAt(new Date().toISOString());
+    setLoadedVaultKey(vaultKey);
     setLoadingVideos(false);
   }, [session, vaultKey]);
 
@@ -760,8 +836,8 @@ function App() {
   }
 
   async function protectExistingVideoNames() {
-    if (!session?.user?.id || !vaultKey || metadataMigrationBusy || rotationBusy) return;
-    const candidates = videos.filter(item => item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\.vlt$/i.test(item.name || ''));
+    if (!session?.user?.id || !vaultKey || metadataMigrationBusy || rotationBusy || integrityChecking) return;
+    const candidates = videos.filter(item => !item.trashedAt && item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\.vlt$/i.test(item.name || ''));
     if (!candidates.length) {
       setMetadataMigrationProgress('Non risultano nomi legacy da proteggere nella libreria caricata.');
       return;
@@ -793,7 +869,7 @@ function App() {
           }
           const newName = crypto.randomUUID() + '.vlt';
           if (item.provider === 'google') {
-            await saveEncryptedVideoMetadata(session.user.id, oldPath, { name: displayName, mime }, vaultKey);
+            await saveEncryptedVideoMetadata(session.user.id, oldPath, { ...(storedMetadata || {}), name: displayName, mime }, vaultKey);
             await googleRequest(session, { action: 'rename', accountId: item.accountId, fileId: item.fileId, name: newName });
           } else if (item.provider === 'backblaze') {
             const directory = item.path.slice(0, item.path.lastIndexOf('/') + 1);
@@ -802,7 +878,7 @@ function App() {
             try {
               const copied = await b2Download(session, newPath);
               await decryptVideo(copied, vaultKey, mime);
-              await saveEncryptedVideoMetadata(session.user.id, newPath, { name: displayName, mime }, vaultKey);
+              await saveEncryptedVideoMetadata(session.user.id, newPath, { ...(storedMetadata || {}), name: displayName, mime }, vaultKey);
               const confirmedCopy = await b2Download(session, newPath);
               await decryptVideo(confirmedCopy, vaultKey, mime);
             } catch (verificationError) {
@@ -841,7 +917,7 @@ function App() {
 
   async function changeVaultPassphrase(event) {
     event.preventDefault();
-    if (!vaultKey || !session?.user?.id) return;
+    if (integrityChecking || trashActionId || !vaultKey || !session?.user?.id) return;
     if (!currentVaultPassphrase) { setError('Inserisci la frase segreta attuale.'); return; }
     const enteredOldKey = await deriveVaultKey(currentVaultPassphrase, session.user.id);
     const [enteredOldRaw, activeRaw] = await Promise.all([crypto.subtle.exportKey('raw', enteredOldKey), crypto.subtle.exportKey('raw', vaultKey)]);
@@ -920,6 +996,7 @@ function App() {
         if (metadata) {
           item.displayName = metadata.name;
           item.mime = metadata.mime;
+          item.vaultMetadata = metadata;
         }
       }
 
@@ -945,14 +1022,30 @@ function App() {
           if (item.provider === 'google') {
             const saved = await googleUpload(session, item.accountId, newName, encrypted);
             const newMetadataPath = 'google:' + item.accountId + ':' + saved.id;
-            await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newMetadataPath), { name: item.displayName, mime: item.mime }, newKey);
+            await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newMetadataPath), {
+              ...(item.vaultMetadata || {}),
+              name: item.displayName,
+              mime: item.mime,
+              integritySha256: null,
+              integritySize: null,
+              integrityLastCheckedAt: null,
+              integrityLastStatus: 'pending',
+            }, newKey);
             stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id, metadataPath: metadataStoragePath(session.user.id, newMetadataPath) });
             const savedCopy = await googleDownload(session, item.accountId, saved.id, saved.size);
             await decryptVideo(savedCopy, newKey, item.mime);
           } else {
             const newPath = session.user.id + '/Vault/' + newName;
             await b2Upload(session, newPath, encrypted);
-            await saveEncryptedVideoMetadata(session.user.id, newPath, { name: item.displayName, mime: item.mime }, newKey);
+            await saveEncryptedVideoMetadata(session.user.id, newPath, {
+              ...(item.vaultMetadata || {}),
+              name: item.displayName,
+              mime: item.mime,
+              integritySha256: null,
+              integritySize: null,
+              integrityLastCheckedAt: null,
+              integrityLastStatus: 'pending',
+            }, newKey);
             stagedItems.push({ provider: 'backblaze', path: newPath, metadataPath: newPath });
             const savedCopy = await b2Download(session, newPath);
             await decryptVideo(savedCopy, newKey, item.mime);
@@ -1022,6 +1115,10 @@ function App() {
   }
 
   async function handleLogout() {
+    if (integrityChecking) {
+      setMessage('Attendi il termine del controllo di integrità prima di uscire.');
+      return;
+    }
     if (!window.confirm('Vuoi davvero uscire dal tuo account Vault?')) return;
     setVaultKey(null);
     if (previewUrl) URL.revokeObjectURL(previewUrl);
@@ -1033,6 +1130,10 @@ function App() {
 
 
   async function connectGoogleDrive() {
+    if (integrityChecking) {
+      setMessage('Attendi il termine del controllo di integrità prima di collegare Google Drive.');
+      return;
+    }
     if (!session?.user?.id || googleConnectBusy) return;
     setGoogleConnectBusy(true);
     setGoogleDriveError('');
@@ -1047,6 +1148,10 @@ function App() {
   }
 
   async function disconnectGoogleDrive(account) {
+    if (integrityChecking) {
+      setMessage('Attendi il termine del controllo di integrità prima di modificare gli account cloud.');
+      return;
+    }
     if (!account?.id || googleDisconnectId) return;
     const confirmed = window.confirm(
       'Vuoi scollegare ' + account.email + ' da Vault? I video resteranno nel suo Google Drive, ma non saranno più visibili in Vault finché non ricollegherai lo stesso account.'
@@ -1068,11 +1173,16 @@ function App() {
   }
 
   function openUploadDestination() {
+    if (integrityChecking || trashActionId) return;
     setError('');
     setUploadDestinationOpen(true);
   }
 
   function chooseUploadDestination(destination) {
+    if (integrityChecking || trashActionId) {
+      setError('Attendi il termine dell’operazione in corso.');
+      return;
+    }
     if (destination.startsWith('google:')) {
       const accountId = destination.slice('google:'.length);
       const account = googleAccounts.find(row => row.id === accountId);
@@ -1092,6 +1202,10 @@ function App() {
     const selected = Array.from(event.target.files || []);
     event.target.value = '';
     if (!selected.length || !session?.user?.id) return;
+    if (integrityChecking || trashActionId) {
+      setError('Attendi il termine dell’operazione in corso prima di caricare o modificare i video.');
+      return;
+    }
     const invalid = selected.find(file => !file.type.startsWith('video/'));
     if (invalid) {
       setError('Puoi caricare soltanto file video.');
@@ -1163,7 +1277,7 @@ function App() {
   }
 
   async function openEncryptedVideo(item) {
-    if (!vaultKey || openingVideoId) return;
+    if (!vaultKey || openingVideoId || integrityChecking || trashActionId) return;
     setOpeningVideoId(item.id);
     setError('');
     try {
@@ -1188,7 +1302,91 @@ function App() {
     }
   }
 
+  async function readMetadataForVideo(item) {
+    const storagePath = metadataStoragePath(session.user.id, item.path);
+    if (item.vaultMetadata) return item.vaultMetadata;
+    const metadataMap = await loadEncryptedVideoMetadata(session.user.id, [storagePath], vaultKey);
+    const existing = metadataMap.get(storagePath);
+    if (existing) return existing;
+    const { data: storedRow, error: rowError } = await supabase
+      .from('vault_video_meta')
+      .select('storage_path')
+      .eq('user_id', session.user.id)
+      .eq('storage_path', storagePath)
+      .maybeSingle();
+    if (rowError) throw new Error('Non riesco a controllare i metadati del video: ' + rowError.message);
+    if (storedRow) {
+      throw new Error('I metadati cifrati esistono ma non sono leggibili con la chiave attuale. Per sicurezza non li sovrascrivo.');
+    }
+    return {
+      name: item.displayName || getDisplayName(item.name),
+      mime: item.mime || getOriginalVideoMime(item.name),
+    };
+  }
+
+  async function verifyVideoIntegrity(item) {
+    const providerResult = item.provider === 'google'
+      ? await googleRequest(session, { action: 'integrity', accountId: item.accountId, fileId: item.fileId })
+      : await b2Request(session, { action: 'integrity', path: item.path });
+    const actual = providerResult.data || {};
+    if (!/^[0-9a-f]{64}$/i.test(actual.sha256 || '') || !Number.isSafeInteger(Number(actual.size)) || Number(actual.size) <= 0) {
+      throw new Error('Il provider non ha restituito un checksum SHA-256 e una dimensione validi.');
+    }
+
+    const actualHash = actual.sha256.toLowerCase();
+    const actualSize = Number(actual.size);
+    const checkedAt = new Date().toISOString();
+    let status = 'pending';
+    let detail = '';
+
+    const fallbackMetadata = {
+      name: item.displayName || getDisplayName(item.name),
+      mime: item.mime || getOriginalVideoMime(item.name),
+    };
+    const metadata = await updateEncryptedVideoMetadata(
+      session.user.id,
+      metadataStoragePath(session.user.id, item.path),
+      vaultKey,
+      fallbackMetadata,
+      currentMetadata => {
+        const previousHash = /^[0-9a-f]{64}$/i.test(currentMetadata.integritySha256 || '')
+          ? currentMetadata.integritySha256.toLowerCase()
+          : '';
+        const previousSize = Number(currentMetadata.integritySize || 0);
+        const nextMetadata = { ...currentMetadata, integrityLastCheckedAt: checkedAt };
+
+        if (!previousHash) {
+          status = 'baseline';
+          detail = 'Prima impronta SHA-256 salvata. I prossimi controlli potranno confrontare il file con questo riferimento.';
+          nextMetadata.integritySha256 = actualHash;
+          nextMetadata.integritySize = actualSize;
+        } else if (previousHash !== actualHash || (previousSize > 0 && previousSize !== actualSize)) {
+          status = 'mismatch';
+          detail = 'Il contenuto attuale non coincide con l’impronta salvata in precedenza. Nessuna copia è stata sostituita o eliminata.';
+        } else {
+          status = 'verified';
+          detail = 'SHA-256 e dimensione coincidono con l’impronta salvata.';
+        }
+        nextMetadata.integrityLastStatus = status;
+        return nextMetadata;
+      }
+    );
+
+    return {
+      result: {
+        id: item.id,
+        name: item.displayName || getDisplayName(item.name),
+        provider: item.providerLabel,
+        status,
+        detail,
+        checkedAt,
+      },
+      metadata,
+    };
+  }
+
   function beginRename(item) {
+    if (integrityChecking || trashActionId) return;
     setRenameItem(item);
     setRenameValue((item.displayName || getDisplayName(item.name)).replace(/\.[^.]+$/, ''));
     setError('');
@@ -1196,7 +1394,7 @@ function App() {
 
   async function saveRename(event) {
     event.preventDefault();
-    if (!renameItem || !session?.user?.id) return;
+    if (integrityChecking || trashActionId || !renameItem || !session?.user?.id) return;
     const clean = renameValue.trim().normalize('NFKC').replace(/[\/\\]/g, '-').replace(/[<>:"|?*]/g, '-').replace(/\s+/g, ' ').slice(0, 100);
     if (!clean) { setError('Inserisci un nome valido.'); return; }
     if (!renameItem.encrypted) { setError('Puoi rinominare solo i video cifrati.'); return; }
@@ -1206,6 +1404,14 @@ function App() {
     const newName = crypto.randomUUID() + '.vlt';
     const newPath = renameItem.provider === 'google' ? renameItem.path : session.user.id + '/Vault/' + newName;
     setRenameBusy(true); setError('');
+    let currentMetadata;
+    try {
+      currentMetadata = await readMetadataForVideo(renameItem);
+    } catch (metadataReadError) {
+      setRenameBusy(false);
+      setError(metadataReadError.message || 'Non riesco a leggere i metadati cifrati.');
+      return;
+    }
     try {
       if (renameItem.provider === 'google') {
         await googleRequest(session, { action: 'rename', accountId: renameItem.accountId, fileId: renameItem.fileId, name: newName });
@@ -1219,7 +1425,7 @@ function App() {
     }
     setRenameBusy(false);
     try {
-      await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newPath), { name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
+      await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newPath), { ...currentMetadata, name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
       if (renameItem.path !== newPath) {
         await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, renameItem.path));
       }
@@ -1252,7 +1458,7 @@ function App() {
   }
 
   async function createTemporaryLink() {
-    if (!shareItem || !session?.user?.id) return;
+    if (integrityChecking || trashActionId || !shareItem || !session?.user?.id) return;
     setShareBusy(true);
     setError('');
     let sharePath = '';
@@ -1300,7 +1506,7 @@ function App() {
   }
 
   async function prepareCopy() {
-    if (!shareItem) return;
+    if (integrityChecking || trashActionId || !shareItem) return;
     setShareBusy(true);
     setError('');
     try {
@@ -1352,30 +1558,188 @@ function App() {
   }
 
   async function deleteVideo(item) {
-    if (!window.confirm('Vuoi eliminare definitivamente questo video? Verranno rimossi anche i link temporanei ancora attivi associati al file.')) return;
-    const { data: linkedShares, error: sharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).eq('original_path', item.path).is('revoked_at', null);
-    if (sharesError) { setError('Non riesco a verificare i link attivi: ' + sharesError.message); return; }
-    if (linkedShares?.length) {
-      try { await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path)); }
-      catch (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
-      await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', linkedShares.map(row => row.id));
-    }
+    if (!item || item.trashedAt || trashActionId || integrityChecking) return;
+    if (!window.confirm('Spostare "' + (item.displayName || 'questo video') + '" nel cestino? Il file resterà nello spazio cloud e continuerà a occupare quota. Gli eventuali link temporanei collegati verranno revocati. Potrai ripristinarlo oppure eliminarlo definitivamente dal cestino.')) return;
+    setTrashActionId(item.id);
+    setError('');
     try {
+      const { data: linkedShares, error: sharesError } = await supabase
+        .from('vault_shares')
+        .select('id,storage_path')
+        .eq('user_id', session.user.id)
+        .eq('original_path', item.path)
+        .is('revoked_at', null);
+      if (sharesError) throw new Error('Non riesco a verificare i link attivi: ' + sharesError.message);
+      if (linkedShares?.length) {
+        await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path));
+        const { error: markSharesError } = await supabase
+          .from('vault_shares')
+          .update({ revoked_at: new Date().toISOString() })
+          .in('id', linkedShares.map(row => row.id));
+        if (markSharesError) throw new Error('Le copie dei link sono state rimosse, ma non riesco ad aggiornare il registro: ' + markSharesError.message);
+      }
+      const trashedAt = new Date().toISOString();
+      await updateEncryptedVideoMetadata(
+        session.user.id,
+        metadataStoragePath(session.user.id, item.path),
+        vaultKey,
+        {
+          name: item.displayName || getDisplayName(item.name),
+          mime: item.mime || getOriginalVideoMime(item.name),
+        },
+        currentMetadata => ({ ...currentMetadata, trashedAt })
+      );
+      await logActivity(session.user.id, 'video_deleted', null, 'Video spostato nel cestino; file conservato nello spazio cloud.');
+      setMessage('Video spostato nel cestino. Il file è ancora conservato e può essere ripristinato.');
+      await Promise.all([loadVideos(), loadSecurityData()]);
+    } catch (trashError) {
+      setError('Non sono riuscito a spostare il video nel cestino: ' + (trashError.message || 'errore sconosciuto'));
+    } finally {
+      setTrashActionId('');
+    }
+  }
+
+  async function restoreVideo(item) {
+    if (!item?.trashedAt || trashActionId || integrityChecking) return;
+    setTrashActionId(item.id);
+    setError('');
+    try {
+      await updateEncryptedVideoMetadata(
+        session.user.id,
+        metadataStoragePath(session.user.id, item.path),
+        vaultKey,
+        {
+          name: item.displayName || getDisplayName(item.name),
+          mime: item.mime || getOriginalVideoMime(item.name),
+          trashedAt: item.trashedAt,
+        },
+        currentMetadata => {
+          const { trashedAt, ...restoredMetadata } = currentMetadata;
+          return restoredMetadata;
+        }
+      );
+      setMessage('Video ripristinato nella galleria.');
+      await loadVideos();
+    } catch (restoreError) {
+      setError('Non sono riuscito a ripristinare il video: ' + (restoreError.message || 'errore sconosciuto'));
+    } finally {
+      setTrashActionId('');
+    }
+  }
+
+  async function permanentlyDeleteVideo(item) {
+    if (!item?.trashedAt || trashActionId || integrityChecking) return;
+    if (!window.confirm('Eliminare definitivamente "' + (item.displayName || 'questo video') + '"? Il file verrà rimosso dal provider cloud e non potrà essere recuperato da Vault.')) return;
+    setTrashActionId(item.id);
+    setError('');
+    try {
+      const { data: linkedShares, error: sharesError } = await supabase
+        .from('vault_shares')
+        .select('id,storage_path')
+        .eq('user_id', session.user.id)
+        .eq('original_path', item.path)
+        .is('revoked_at', null);
+      if (sharesError) throw new Error('Non riesco a verificare i link collegati: ' + sharesError.message);
+      if (linkedShares?.length) {
+        await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path));
+        const { error: markSharesError } = await supabase
+          .from('vault_shares')
+          .update({ revoked_at: new Date().toISOString() })
+          .in('id', linkedShares.map(row => row.id));
+        if (markSharesError) throw new Error('Non riesco ad aggiornare il registro dei link: ' + markSharesError.message);
+      }
       if (item.provider === 'google') {
         await googleRequest(session, { action: 'delete', accountId: item.accountId, fileId: item.fileId });
       } else {
         await b2Delete(session, [item.path]);
       }
-    } catch (deleteError) { setError(deleteError.message); return; }
-    {
-      await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, item.path));
-      await logActivity(session.user.id, 'video_deleted', null, 'Video eliminato dalla libreria');
-      setVideos(current => current.filter(v => v.id !== item.id));
+      const { error: metadataDeleteError } = await supabase
+        .from('vault_video_meta')
+        .delete()
+        .eq('user_id', session.user.id)
+        .eq('storage_path', metadataStoragePath(session.user.id, item.path));
+      if (metadataDeleteError) {
+        console.warn('File eliminato ma metadati da ripulire:', metadataDeleteError.message);
+        setError('Il video è stato eliminato dal cloud, ma alcuni metadati non sono stati ripuliti. Aggiorna la libreria.');
+      } else {
+        setMessage('Video eliminato definitivamente.');
+      }
+      await logActivity(session.user.id, 'video_deleted', null, 'Video eliminato definitivamente dal cestino.');
       if (shareItem?.id === item.id) {
         setShareItem(null);
         setShareUrl('');
       }
-      await loadSecurityData();
+      await Promise.all([loadVideos(), loadSecurityData()]);
+    } catch (deleteError) {
+      setError('Non sono riuscito a eliminare definitivamente il video: ' + (deleteError.message || 'errore sconosciuto'));
+    } finally {
+      setTrashActionId('');
+    }
+  }
+
+  async function runIntegrityCheck() {
+    if (!session?.user?.id || !vaultKey || integrityChecking || trashActionId || renameBusy || openingVideoId || shareBusy || !videos.length || uploading || rotationBusy || metadataMigrationBusy) return;
+    const targets = [...videos];
+    const confirmed = window.confirm(
+      'Vault controllerà l’impronta SHA-256 di ' + targets.length + ' video. Per Backblaze il contenuto cifrato verrà letto integralmente dal server; su Google verrà usato il checksum del provider se disponibile, altrimenti il file verrà letto dal server. La verifica può richiedere tempo e generare traffico di lettura, ma non modifica né scarica i video sul tuo dispositivo. Vuoi continuare?'
+    );
+    if (!confirmed) return;
+    if (automaticIntegrityTimerRef.current) {
+      window.clearTimeout(automaticIntegrityTimerRef.current);
+      automaticIntegrityTimerRef.current = null;
+    }
+
+    setIntegrityChecking(true);
+    setIntegrityProgress('Preparazione dei controlli…');
+    setIntegrityResults([]);
+    setError('');
+    const results = [];
+    automaticIntegrityStartedRef.current = true;
+    try {
+      for (let index = 0; index < targets.length; index++) {
+        const item = targets[index];
+        const displayName = item.displayName || getDisplayName(item.name);
+        setIntegrityProgress('Verifica ' + (index + 1) + ' di ' + targets.length + ': ' + displayName);
+        try {
+          const checked = await verifyVideoIntegrity(item);
+          results.push(checked.result);
+          setVideos(current => current.map(video => video.id === item.id ? {
+            ...video,
+            vaultMetadata: checked.metadata,
+            encryptedMetadata: true,
+            integritySha256: checked.metadata.integritySha256 || '',
+            integritySize: Number(checked.metadata.integritySize || 0),
+            integrityLastStatus: checked.metadata.integrityLastStatus || 'pending',
+            integrityLastCheckedAt: checked.metadata.integrityLastCheckedAt || null,
+          } : video));
+        } catch (itemError) {
+          results.push({
+            id: item.id,
+            name: displayName,
+            provider: item.providerLabel,
+            status: 'error',
+            detail: itemError.message || 'Errore durante il controllo.',
+            checkedAt: new Date().toISOString(),
+          });
+          setVideos(current => current.map(video => video.id === item.id
+            ? { ...video, integrityLastStatus: 'error' }
+            : video
+          ));
+        }
+        setIntegrityResults([...results]);
+      }
+      setIntegrityRunAt(new Date().toISOString());
+      const mismatches = results.filter(result => result.status === 'mismatch').length;
+      const errors = results.filter(result => result.status === 'error').length;
+      const baselines = results.filter(result => result.status === 'baseline').length;
+      const verified = results.filter(result => result.status === 'verified').length;
+      setMessage(
+        'Controllo completato: ' + verified + ' verificati, ' + baselines + ' prime impronte salvate, ' +
+        mismatches + ' anomalie' + (errors ? ', ' + errors + ' non controllati.' : '.')
+      );
+    } finally {
+      setIntegrityChecking(false);
+      setIntegrityProgress('');
     }
   }
 
@@ -1485,9 +1849,13 @@ function App() {
     }
   }
 
-  const visibleVideos = useMemo(() => videos
+  const activeVideos = useMemo(() => videos.filter(video => !video.trashedAt), [videos]);
+  const trashedVideos = useMemo(() => videos
+    .filter(video => Boolean(video.trashedAt))
+    .sort((a, b) => new Date(b.trashedAt || 0) - new Date(a.trashedAt || 0)), [videos]);
+  const visibleVideos = useMemo(() => activeVideos
     .filter(video => (video.displayName || video.name).toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)), [videos, search]);
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)), [activeVideos, search]);
   const securityAlerts = shares.filter(share => !share.revoked_at && new Date(share.expires_at).getTime() <= nowTick + 15 * 60 * 1000);
   useEffect(() => {
     if (!notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
@@ -1523,23 +1891,32 @@ function App() {
   const otherGoogleSegment = hasDriveBreakdown
     ? Math.max(0, driveTotalUsedBytes - driveVideoSegment - driveOtherFilesSegment)
     : Math.max(0, driveTotalUsedBytes - driveVideoSegment);
-  const unencryptedVideoCount = videos.filter(item => !item.encrypted).length;
-  const visibleStorageNameCount = videos.filter(item => !isOpaqueVaultName(item.name)).length;
-  const missingMetadataCount = videos.filter(item => item.encrypted && !item.encryptedMetadata).length;
+  const unencryptedVideoCount = activeVideos.filter(item => !item.encrypted).length;
+  const visibleStorageNameCount = activeVideos.filter(item => !isOpaqueVaultName(item.name)).length;
+  const missingMetadataCount = activeVideos.filter(item => item.encrypted && !item.encryptedMetadata).length;
   const activeLinkCount = shares.filter(share => !share.revoked_at && new Date(share.expires_at).getTime() > nowTick).length;
-  const securityState = !videos.length
-    ? 'unknown'
-    : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0)
-      ? 'weak'
-      : missingMetadataCount > 0
-        ? 'check'
-        : 'good';
+  const integrityMismatchCount = videos.filter(item => item.integrityLastStatus === 'mismatch').length;
+  const integrityVerifiedCount = videos.filter(item => item.integrityLastStatus === 'verified').length;
+  const integrityBaselineCount = videos.filter(item => item.integrityLastStatus === 'baseline').length;
+  const integrityPendingCount = videos.filter(item => !['verified', 'mismatch', 'baseline'].includes(item.integrityLastStatus)).length;
+  const securityState = integrityMismatchCount > 0
+    ? 'weak'
+    : !activeVideos.length
+      ? 'unknown'
+      : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0)
+        ? 'weak'
+        : (missingMetadataCount > 0 || integrityPendingCount > 0 || integrityBaselineCount > 0)
+          ? 'check'
+          : 'good';
   const securityReasons = [];
   if (unencryptedVideoCount > 0) securityReasons.push(unencryptedVideoCount + ' video non risultano cifrati (non hanno il formato .vlt).');
   if (visibleStorageNameCount > 0) securityReasons.push(visibleStorageNameCount + ' file hanno ancora un nome riconoscibile nello spazio cloud.');
   if (missingMetadataCount > 0) securityReasons.push('I metadati cifrati del titolo non sono disponibili per ' + missingMetadataCount + ' video.');
+  if (integrityMismatchCount > 0) securityReasons.push(integrityMismatchCount + ' video non corrispondono alla loro impronta SHA-256 salvata. Non sono stati modificati automaticamente.');
+  if (integrityPendingCount > 0) securityReasons.push(integrityPendingCount + ' video non hanno ancora una verifica SHA-256 completata.');
+  if (integrityBaselineCount > 0) securityReasons.push(integrityBaselineCount + ' video hanno soltanto la prima impronta di riferimento; un controllo successivo serve per confrontare i dati nel tempo.');
   const securitySummary = securityState === 'good'
-    ? 'I video elencati risultano cifrati e salvati con nomi casuali.'
+    ? 'I video attivi risultano cifrati, hanno nomi casuali e le ultime impronte SHA-256 coincidono con i riferimenti salvati.'
     : securityState === 'weak'
       ? 'Ci sono elementi da proteggere: controlla i motivi indicati qui sotto.'
       : securityState === 'check'
@@ -1551,6 +1928,94 @@ function App() {
       ? (bytes / 1_000_000).toFixed(1) + ' MB'
       : (bytes / 1_000_000_000).toFixed(2) + ' GB';
   const formatDate = value => value ? new Date(value).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+
+  useEffect(() => {
+    automaticIntegrityStartedRef.current = false;
+    setDataUpdatedAt(null);
+  }, [session?.user?.id, vaultKey]);
+
+  useEffect(() => {
+    if (!session?.user?.id || !vaultKey || loadedVaultKey !== vaultKey || incomingShare || !dataUpdatedAt || loadingVideos || !videos.length ||
+        uploading || rotationBusy || metadataMigrationBusy || integrityChecking ||
+        trashActionId || renameBusy || openingVideoId || shareBusy || automaticIntegrityStartedRef.current) return;
+
+    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const dueItems = videos
+      .filter(item => {
+        const lastChecked = item.integrityLastCheckedAt ? new Date(item.integrityLastCheckedAt).getTime() : 0;
+        return !Number.isFinite(lastChecked) || lastChecked === 0 || now - lastChecked >= maxAgeMs;
+      })
+      .sort((a, b) => {
+        const aDate = a.integrityLastCheckedAt ? new Date(a.integrityLastCheckedAt).getTime() : 0;
+        const bDate = b.integrityLastCheckedAt ? new Date(b.integrityLastCheckedAt).getTime() : 0;
+        return aDate - bDate;
+      });
+    if (!dueItems.length) return;
+
+    const candidate = dueItems[0];
+    automaticIntegrityStartedRef.current = true;
+    let cancelled = false;
+    let started = false;
+    setIntegrityProgress('Controllo automatico in coda: ' + (candidate.displayName || getDisplayName(candidate.name)));
+    const timer = window.setTimeout(async () => {
+      started = true;
+      automaticIntegrityTimerRef.current = null;
+      if (cancelled) return;
+      setIntegrityChecking(true);
+      setIntegrityProgress('Controllo automatico: ' + (candidate.displayName || getDisplayName(candidate.name)));
+      try {
+        const checked = await verifyVideoIntegrity(candidate);
+        if (cancelled) return;
+        setVideos(current => current.map(video => video.id === candidate.id ? {
+          ...video,
+          vaultMetadata: checked.metadata,
+          encryptedMetadata: true,
+          integritySha256: checked.metadata.integritySha256 || '',
+          integritySize: Number(checked.metadata.integritySize || 0),
+          integrityLastStatus: checked.metadata.integrityLastStatus || 'pending',
+          integrityLastCheckedAt: checked.metadata.integrityLastCheckedAt || null,
+        } : video));
+        setIntegrityResults([checked.result]);
+        setIntegrityRunAt(new Date().toISOString());
+        setMessage(checked.result.status === 'mismatch'
+          ? 'Controllo automatico: rilevata un’anomalia in "' + checked.result.name + '". Consulta la Panoramica.'
+          : checked.result.status === 'baseline'
+            ? 'Controllo automatico: salvata la prima impronta di "' + checked.result.name + '".'
+            : 'Controllo automatico completato per "' + checked.result.name + '".');
+      } catch (checkError) {
+        if (!cancelled) {
+          setIntegrityResults([{
+            id: candidate.id,
+            name: candidate.displayName || getDisplayName(candidate.name),
+            provider: candidate.providerLabel,
+            status: 'error',
+            detail: checkError.message || 'Errore durante il controllo automatico.',
+            checkedAt: new Date().toISOString(),
+          }]);
+          setVideos(current => current.map(video => video.id === candidate.id
+            ? { ...video, integrityLastStatus: 'error' }
+            : video
+          ));
+          setError('Controllo automatico non completato: ' + (checkError.message || 'errore sconosciuto') + '. Puoi riprovare da Panoramica.');
+        }
+      } finally {
+        if (!cancelled) {
+          setIntegrityChecking(false);
+          setIntegrityProgress('');
+        }
+      }
+    }, 1200);
+    automaticIntegrityTimerRef.current = timer;
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      if (automaticIntegrityTimerRef.current === timer) automaticIntegrityTimerRef.current = null;
+      if (!started) automaticIntegrityStartedRef.current = false;
+      if (started) setIntegrityChecking(false);
+      setIntegrityProgress('');
+    };
+  }, [session?.user?.id, vaultKey, loadingVideos, dataUpdatedAt, loadedVaultKey, incomingShare, openingVideoId, shareBusy, uploading, rotationBusy, metadataMigrationBusy, integrityChecking, trashActionId, renameBusy]);
 
   if (incomingShare) return (
     <main className="auth-page incoming-share-page">
@@ -1618,7 +2083,7 @@ function App() {
       </header>
       <nav className="vault-navigation" aria-label="Sezioni di Vault">
         <button type="button" className={'vault-nav-tab ' + (activeSection === 'gallery' ? 'active' : '')} onClick={() => setActiveSection('gallery')} aria-current={activeSection === 'gallery' ? 'page' : undefined}>
-          <Film size={17}/> Galleria <span>{videos.length}</span>
+          <Film size={17}/> Galleria <span>{activeVideos.length}</span>
         </button>
         <button type="button" className={'vault-nav-tab ' + (activeSection === 'overview' ? 'active' : '')} onClick={() => setActiveSection('overview')} aria-current={activeSection === 'overview' ? 'page' : undefined}>
           <Activity size={17}/> Panoramica
@@ -1628,7 +2093,7 @@ function App() {
         <section className="welcome">
           <div><div className="eyebrow"><span className="pulse-dot"/> IL TUO SPAZIO PERSONALE</div><h1>La tua <span>galleria.</span></h1><p>I tuoi video privati, ordinati in un unico posto. I nuovi caricamenti vengono cifrati sul dispositivo.</p></div>
           <div className="welcome-actions">
-            <button className="upload-btn" type="button" onClick={openUploadDestination}><UploadCloud size={18}/> Carica video</button>
+            <button className="upload-btn" type="button" onClick={openUploadDestination} disabled={integrityChecking || trashActionId !== ''}><UploadCloud size={18}/> Carica video</button>
           </div>
         </section>
       ) : (
@@ -1639,7 +2104,7 @@ function App() {
             <p>Spazio occupato, account collegati e controlli di protezione.</p>
             <div className="overview-updated">{dataUpdatedAt ? 'Dati aggiornati il ' + new Date(dataUpdatedAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' }) : 'Dati non ancora aggiornati'}</div>
           </div>
-          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading}>
+          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading || integrityChecking || openingVideoId !== null || shareBusy}>
             {loadingVideos || securityLoading ? <LoaderCircle className="spin" size={16}/> : <RefreshCw size={16}/>}
             Aggiorna dati
           </button>
@@ -1647,7 +2112,7 @@ function App() {
       )}
       <input ref={uploadInputRef} type="file" accept="video/*" multiple hidden onChange={handleUpload}/>
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
-      {uploadDestinationOpen && <div className="modal-backdrop" onClick={() => setUploadDestinationOpen(false)}><div className="share-modal upload-destination-modal" onClick={event => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setUploadDestinationOpen(false)} aria-label="Chiudi"><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">NUOVO CARICAMENTO</div><h2>Dove vuoi salvarlo?</h2><p>Scegli la destinazione per questo caricamento. Il video verrà cifrato sul dispositivo prima del trasferimento.</p><div className="upload-destination-options"><button className="upload-destination-option" type="button" onClick={() => chooseUploadDestination('backblaze')}><span className="upload-destination-icon"><ShieldCheck size={20}/></span><span><b>Backblaze B2</b><small>Spazio personale Vault</small></span><ArrowUpRight size={17}/></button>{googleAccounts.map(account => <button className="upload-destination-option" type="button" key={account.id} disabled={account.status === 'error'} onClick={() => chooseUploadDestination('google:' + account.id)}><span className="upload-destination-icon"><HardDrive size={20}/></span><span><b>Google Drive</b><small>{account.status === 'error' ? 'Account da ricollegare' : account.email}</small></span>{account.status === 'error' ? <AlertCircle size={17}/> : <ArrowUpRight size={17}/>}</button>)}</div>{googleAccounts.length === 0 && <button className="secondary-share-btn" type="button" onClick={() => {setUploadDestinationOpen(false);setStorageOpen(true);}}><HardDrive size={16}/> Collega Google Drive</button>}</div></div>}
+      {uploadDestinationOpen && <div className="modal-backdrop" onClick={() => setUploadDestinationOpen(false)}><div className="share-modal upload-destination-modal" onClick={event => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setUploadDestinationOpen(false)} aria-label="Chiudi"><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">NUOVO CARICAMENTO</div><h2>Dove vuoi salvarlo?</h2><p>Scegli la destinazione per questo caricamento. Il video verrà cifrato sul dispositivo prima del trasferimento.</p><div className="upload-destination-options"><button className="upload-destination-option" type="button" disabled={integrityChecking || Boolean(trashActionId)} onClick={() => chooseUploadDestination('backblaze')}><span className="upload-destination-icon"><ShieldCheck size={20}/></span><span><b>Backblaze B2</b><small>Spazio personale Vault</small></span><ArrowUpRight size={17}/></button>{googleAccounts.map(account => <button className="upload-destination-option" type="button" key={account.id} disabled={account.status === 'error' || integrityChecking || Boolean(trashActionId)} onClick={() => chooseUploadDestination('google:' + account.id)}><span className="upload-destination-icon"><HardDrive size={20}/></span><span><b>Google Drive</b><small>{account.status === 'error' ? 'Account da ricollegare' : account.email}</small></span>{account.status === 'error' ? <AlertCircle size={17}/> : <ArrowUpRight size={17}/>}</button>)}</div>{googleAccounts.length === 0 && <button className="secondary-share-btn" type="button" onClick={() => {setUploadDestinationOpen(false);setStorageOpen(true);}}><HardDrive size={16}/> Collega Google Drive</button>}</div></div>}
       {error && <div className="notice error dashboard-notice"><AlertCircle size={16}/>{error}<button onClick={() => setError('')}><X size={15}/></button></div>}
       {activeSection === 'overview' && (
         <section className="vault-overview" aria-label="Panoramica dello spazio e della sicurezza">
@@ -1744,9 +2209,9 @@ function App() {
                   : 'La valutazione non è massima: consulta i motivi elencati e correggi gli elementi che non risultano protetti.'}</p></div>
             </div>
             <div className="security-metrics-grid">
-              <div><span>Video cifrati</span><strong>{videos.filter(item => item.encrypted).length} / {videos.length}</strong><small>Formato Vault .vlt</small></div>
-              <div><span>Nomi casuali nel cloud</span><strong>{videos.filter(item => isOpaqueVaultName(item.name)).length} / {videos.length}</strong><small>Identificativi non descrittivi</small></div>
-              <div><span>Titoli cifrati disponibili</span><strong>{videos.filter(item => item.encryptedMetadata).length} / {videos.length}</strong><small>Metadati leggibili da Vault</small></div>
+              <div><span>Video cifrati</span><strong>{activeVideos.filter(item => item.encrypted).length} / {activeVideos.length}</strong><small>Formato Vault .vlt · galleria</small></div>
+              <div><span>Nomi casuali nel cloud</span><strong>{activeVideos.filter(item => isOpaqueVaultName(item.name)).length} / {activeVideos.length}</strong><small>Identificativi non descrittivi</small></div>
+              <div><span>Titoli cifrati disponibili</span><strong>{activeVideos.filter(item => item.encryptedMetadata).length} / {activeVideos.length}</strong><small>Metadati leggibili da Vault</small></div>
               <div><span>Link temporanei attivi</span><strong>{activeLinkCount}</strong><small>Condivisioni ancora valide</small></div>
             </div>
             {securityReasons.length > 0 && (
@@ -1756,20 +2221,64 @@ function App() {
               </div>
             )}
             {activeLinkCount > 0 && <p className="overview-footnote">Sono presenti {activeLinkCount} link temporanei attivi. Chi possiede un link valido può accedere al video condiviso fino alla scadenza o alla revoca.</p>}
-            <p className="overview-footnote">Vault verifica i file e i metadati caricati nella sessione corrente. Non può rilevare da solo screenshot, copie già scaricate da destinatari o modifiche avvenute fuori dall’app.</p>
+            <section className="integrity-panel">
+              <div className="integrity-panel-head">
+                <div>
+                  <span className="overview-eyebrow">CONTROLLO DEI CONTENUTI</span>
+                  <h3>Integrità dei video</h3>
+                  <p>Confronta i file cifrati con le impronte SHA-256 conservate nei metadati cifrati di Vault. In automatico controlla un video ancora senza impronta o con un controllo vecchio di almeno 30 giorni a ogni sblocco; puoi avviare una verifica completa quando preferisci.</p>
+                </div>
+                <button
+                  className="overview-refresh-btn"
+                  type="button"
+                  onClick={runIntegrityCheck}
+                  disabled={integrityChecking || trashActionId !== '' || renameBusy || openingVideoId !== null || shareBusy || loadingVideos || uploading || rotationBusy || metadataMigrationBusy || !videos.length}
+                >
+                  {integrityChecking ? <LoaderCircle className="spin" size={16}/> : <ShieldCheck size={16}/>}
+                  {integrityChecking ? 'Verifica in corso…' : 'Verifica integrità'}
+                </button>
+              </div>
+              <div className="integrity-summary-grid">
+                <div><span>Verificati</span><strong>{integrityVerifiedCount}</strong></div>
+                <div><span>Prime impronte</span><strong>{integrityBaselineCount}</strong></div>
+                <div><span>Anomalie</span><strong>{integrityMismatchCount}</strong></div>
+                <div><span>Da controllare</span><strong>{integrityPendingCount}</strong></div>
+              </div>
+              {integrityProgress && <div className="integrity-progress"><LoaderCircle className="spin" size={15}/>{integrityProgress}</div>}
+              {integrityRunAt && <p className="overview-footnote">Ultimo controllo: {new Date(integrityRunAt).toLocaleString('it-IT')} · comprende anche i video nel cestino.</p>}
+              {integrityResults.length > 0 && (
+                <div className="integrity-results">
+                  <strong>Risultati dell’ultima verifica</strong>
+                  {integrityResults.slice(0, 8).map(result => (
+                    <div className="integrity-result-row" key={result.id}>
+                      <div className="integrity-result-copy">
+                        <b>{result.name}</b>
+                        <span>{result.detail}</span>
+                      </div>
+                      <span className={'integrity-result-status integrity-result-' + result.status}>
+                        {result.status === 'verified' ? 'OK' : result.status === 'baseline' ? 'IMPRONTA CREATA' : result.status === 'mismatch' ? 'ANOMALIA' : 'ERRORE'}
+                      </span>
+                    </div>
+                  ))}
+                  {integrityResults.length > 8 && <p className="overview-footnote">Altri {integrityResults.length - 8} risultati sono disponibili nello stato riepilogativo.</p>}
+                </div>
+              )}
+              <p className="overview-footnote">Il primo controllo di un video crea la sua impronta di riferimento: non può dimostrare che il file non fosse già danneggiato prima. I controlli successivi verificano che il contenuto coincida con quell’impronta. Una differenza viene segnalata, mai riparata o sovrascritta automaticamente.</p>
+            </section>
+            <p className="overview-footnote">La verifica riguarda i byte cifrati conservati dal provider. Non è un audit esterno e non può rilevare copie già scaricate o modifiche avvenute fuori da Vault.</p>
           </article>
         </section>
       )}
       {activeSection === 'gallery' && (
       <section className="library">
-        <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{videos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div></div></div>
+        <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{activeVideos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div><button className="trash-open-btn" type="button" onClick={() => setTrashOpen(true)}><Trash2 size={15}/> Cestino <span>{trashedVideos.length}</span></button></div></div>
         {loadingVideos ? <div className="empty-state"><LoaderCircle className="spin" size={24}/><p>Sto aprendo la cassaforte…</p></div> : visibleVideos.length === 0 ? (
-          <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{videos.length ? 'Nessun risultato' : 'La tua cassaforte è vuota'}</h3><p>{videos.length ? 'Prova con un altro nome.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.'}</p>{!videos.length && <button className="secondary-btn" type="button" onClick={openUploadDestination}><UploadCloud size={17}/> Seleziona video</button>}</div>
+          <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{activeVideos.length ? 'Nessun risultato' : 'La tua galleria è vuota'}</h3><p>{activeVideos.length ? 'Prova con un altro nome.' : (trashedVideos.length ? 'I tuoi video sono nel cestino: puoi ripristinarli quando vuoi.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.')}</p>{!activeVideos.length && !trashedVideos.length && <button className="secondary-btn" type="button" onClick={openUploadDestination}><UploadCloud size={17}/> Seleziona video</button>}{!activeVideos.length && trashedVideos.length > 0 && <button className="secondary-btn" type="button" onClick={() => setTrashOpen(true)}><Trash2 size={16}/> Apri cestino</button>}</div>
         ) : (
           <div className="video-grid">{visibleVideos.map(item => (
             <article className="video-card" key={item.id}>
-              <button className="video-preview encrypted-preview" style={thumbnails[item.path] ? { backgroundImage: 'linear-gradient(#0002,#0002),url("' + thumbnails[item.path] + '")', backgroundSize: 'cover', backgroundPosition: 'center' } : undefined} disabled={openingVideoId !== null} onClick={() => item.encrypted ? openEncryptedVideo(item) : setError('Questo è un vecchio video non cifrato. Scaricalo e ricaricalo dopo la modifica per proteggerlo.') }>{thumbnails[item.path] ? <span className="thumb-play"><Play size={24} fill="currentColor"/></span> : <div className="video-placeholder">{openingVideoId === item.id ? <><LoaderCircle className="spin" size={32}/><span>APERTURA IN CORSO…</span></> : <><LockKeyhole size={32}/><span>{item.encrypted ? 'CIFRATO' : 'NON CIFRATO'}</span></>}</div>}<span className="private-tag"><LockKeyhole size={11}/> {item.encrypted ? 'AES-256' : 'VECCHIO FILE'}</span></button>
-              <div className="video-info"><h3 title={item.displayName}>{item.displayName}</h3><div className="video-source"><HardDrive size={12}/>{item.providerLabel || 'Backblaze B2'}</div><div className="video-meta"><span><Clock3 size={13}/>{formatDate(item.created_at)}</span><span>{formatSize(item.size)}</span></div><div className="video-actions"><button className="share-btn" disabled={openingVideoId !== null} onClick={() => createShare(item)}><Share2 size={14}/> Condividi</button>{item.encrypted && <button className="delete-btn" onClick={() => beginRename(item)} title="Modifica nome"><Pencil size={16}/></button>}<button className="delete-btn" onClick={() => deleteVideo(item)} title="Elimina video"><Trash2 size={16}/></button></div></div>
+              <button className="video-preview encrypted-preview" style={thumbnails[item.path] ? { backgroundImage: 'linear-gradient(#0002,#0002),url("' + thumbnails[item.path] + '")', backgroundSize: 'cover', backgroundPosition: 'center' } : undefined} disabled={openingVideoId !== null || integrityChecking || Boolean(trashActionId)} onClick={() => item.encrypted ? openEncryptedVideo(item) : setError('Questo è un vecchio video non cifrato. Scaricalo e ricaricalo dopo la modifica per proteggerlo.') }>{thumbnails[item.path] ? <span className="thumb-play"><Play size={24} fill="currentColor"/></span> : <div className="video-placeholder">{openingVideoId === item.id ? <><LoaderCircle className="spin" size={32}/><span>APERTURA IN CORSO…</span></> : <><LockKeyhole size={32}/><span>{item.encrypted ? 'CIFRATO' : 'NON CIFRATO'}</span></>}</div>}<span className="private-tag"><LockKeyhole size={11}/> {item.encrypted ? 'AES-256' : 'VECCHIO FILE'}</span></button>
+              <div className="video-info"><h3 title={item.displayName}>{item.displayName}</h3><div className="video-source"><HardDrive size={12}/>{item.providerLabel || 'Backblaze B2'}</div><div className="video-meta"><span><Clock3 size={13}/>{formatDate(item.created_at)}</span><span>{formatSize(item.size)}</span></div><div className="video-actions"><button className="share-btn" disabled={openingVideoId !== null || integrityChecking || Boolean(trashActionId)} onClick={() => createShare(item)}><Share2 size={14}/> Condividi</button>{item.encrypted && <button className="delete-btn" onClick={() => beginRename(item)} title="Modifica nome"><Pencil size={16}/></button>}<button className="delete-btn" onClick={() => deleteVideo(item)} title="Sposta nel cestino" disabled={Boolean(trashActionId) || integrityChecking}><Trash2 size={16}/></button></div></div>
             </article>
           ))}</div>
         )}
@@ -1777,7 +2286,7 @@ function App() {
       )}
       <footer className="dash-footer"><span><ShieldCheck size={14}/> I video sono cifrati sul dispositivo prima del salvataggio nella destinazione scelta.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
       {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
-      {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
+      {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {if (integrityChecking) {setMessage('Attendi il termine del controllo di integrità.'); return;} setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
       {storageOpen && <div className="modal-backdrop" onClick={() => !googleConnectBusy && !uploading && setStorageOpen(false)}><div className="share-modal settings-detail-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !googleConnectBusy && !uploading && setStorageOpen(false)}><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI ARCHIVIAZIONE</div><h2>Destinazione dei video</h2><p>Scegli dove salvare i prossimi video e gestisci gli account collegati.</p>
       <section className="storage-panel">
         <div className="storage-panel-head">
@@ -1824,8 +2333,9 @@ function App() {
       </section>
       </div></div>}
       {accountOpen && <div className="modal-backdrop" onClick={() => !accountBusy && setAccountOpen(false)}><div className="share-modal account-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !accountBusy && setAccountOpen(false)}><X size={18}/></button><div className="modal-icon"><UserRound size={21}/></div><div className="section-kicker">IL TUO ACCOUNT</div><h2>Profilo e credenziali</h2><p>Gestisci i dati dell’account. La frase segreta Vault resta separata dalla password.</p><div className="account-field"><label>Email attuale</label><div className="account-current">{session.user.email}</div></div><label>Nome visualizzato</label><div className="input-wrap"><UserRound size={17}/><input value={accountName} onChange={e => setAccountName(e.target.value)} maxLength={60} placeholder="Nome profilo"/></div><button className="primary-btn copy-btn" type="button" disabled={accountBusy} onClick={saveAccountName}>{accountBusy ? <LoaderCircle className="spin" size={16}/> : <Check size={16}/>} Salva nome</button><div className="account-divider"/><label>Nuovo indirizzo email</label><div className="input-wrap"><Mail size={17}/><input type="email" value={accountEmail} onChange={e => setAccountEmail(e.target.value)} autoComplete="email" placeholder="nuova@email.com"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy} onClick={requestAccountEmailChange}>Richiedi cambio email</button><p className="card-sub account-hint">Il cambio potrebbe richiedere la conferma tramite email.</p><div className="account-divider"/><label>Password attuale</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={currentAccountPassword} onChange={e => setCurrentAccountPassword(e.target.value)} autoComplete="current-password" placeholder="Password attuale"/></div><label>Nuova password</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={newAccountPassword} onChange={e => setNewAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Almeno 8 caratteri"/></div><label>Conferma nuova password</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={confirmAccountPassword} onChange={e => setConfirmAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Ripeti la nuova password"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy || !currentAccountPassword || newAccountPassword.length < 8 || !confirmAccountPassword} onClick={updateAccountPassword}>Aggiorna password</button>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}</div></div>}
-      {securityOpen && <div className="modal-backdrop" onClick={() => setSecurityOpen(false)}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSecurityOpen(false)}><X size={18}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
+      {securityOpen && <div className="modal-backdrop" onClick={() => setSecurityOpen(false)}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSecurityOpen(false)}><X size={18}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:(entry.details || '').includes('cestino') ? ((entry.details || '').includes('definitivamente') ? 'Video eliminato definitivamente' : 'Video spostato nel cestino') : 'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
       {settingsOpen && <div className="modal-backdrop" onClick={() => !rotationBusy && setSettingsOpen(false)}><div className="share-modal settings-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={rotationBusy} onClick={() => setSettingsOpen(false)}><X size={18}/></button><div className="modal-icon"><KeyRound size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI SICUREZZA</div><h2>Modifica frase segreta</h2><p>Vault ricifrerà tutti i video con la nuova frase. Le frasi vengono elaborate solo sul dispositivo e non vengono inviate ai server.</p><div className="security-option" style={{marginBottom:20,padding:16,border:'1px solid var(--border)',borderRadius:14}}><div className="section-kicker">PRIVACY DEI FILE</div><h3 style={{margin:'6px 0'}}>Proteggi i nomi dei video esistenti</h3><p style={{margin:'0 0 12px'}}>Sostituisce i vecchi nomi visibili negli archivi con nomi casuali. I nomi originali restano disponibili in Vault, salvati in metadati cifrati.</p><button className="primary-btn" type="button" disabled={metadataMigrationBusy || rotationBusy || !vaultKey || !videos.length} onClick={protectExistingVideoNames}>{metadataMigrationBusy ? 'Protezione in corso…' : 'Proteggi i video esistenti'}</button>{metadataMigrationProgress && <p role="status" style={{margin:'10px 0 0'}}>{metadataMigrationProgress}</p>}</div><form onSubmit={changeVaultPassphrase}><label>Frase segreta attuale</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={currentVaultPassphrase} onChange={e => setCurrentVaultPassphrase(e.target.value)} autoComplete="current-password" required placeholder="Inserisci la frase attuale"/></div><label>Nuova frase segreta</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphrase ? 'text' : 'password'} value={newVaultPassphrase} onChange={e => setNewVaultPassphrase(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Almeno 12 caratteri"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphrase(v => !v)} aria-label="Mostra nuova frase">{showNewVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><label>Conferma nuova frase</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphraseConfirm ? 'text' : 'password'} value={newVaultPassphraseConfirm} onChange={e => setNewVaultPassphraseConfirm(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Ripeti la nuova frase"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphraseConfirm(v => !v)} aria-label="Mostra conferma nuova frase">{showNewVaultPassphraseConfirm ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><p className="card-sub settings-warning">Non chiudere la pagina durante la procedura. Gli originali vengono eliminati solo dopo la verifica di tutte le nuove copie.</p><button className="primary-btn copy-btn" disabled={rotationBusy}>{rotationBusy ? <><LoaderCircle className="spin" size={17}/> Aggiornamento in corso…</> : <><ShieldCheck size={17}/> Ricifra e aggiorna la frase</>}</button></form>{rotationProgress && <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/>{rotationProgress}</div>}</div></div>}
+      {trashOpen && <div className="modal-backdrop" onClick={() => !trashActionId && setTrashOpen(false)}><div className="share-modal trash-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={Boolean(trashActionId)} onClick={() => setTrashOpen(false)}><X size={18}/></button><div className="modal-icon"><Trash2 size={21}/></div><div className="section-kicker">RECUPERO DEI CONTENUTI</div><h2>Cestino</h2><p>I video qui restano nel provider cloud e continuano a occupare spazio. Non vengono eliminati automaticamente: puoi ripristinarli oppure eliminarli definitivamente quando decidi tu.</p>{trashedVideos.length === 0 ? <div className="security-empty">Il cestino è vuoto.</div> : <div className="trash-list">{trashedVideos.map(item => <div className="trash-row" key={item.id}><div className="trash-row-copy"><b>{item.displayName || getDisplayName(item.name)}</b><span>{item.providerLabel} · {formatSize(item.size)} · nel cestino dal {new Date(item.trashedAt).toLocaleDateString('it-IT')}</span></div><div className="trash-row-actions"><button type="button" className="trash-restore-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={() => restoreVideo(item)}>{trashActionId === item.id ? <LoaderCircle className="spin" size={14}/> : <RefreshCw size={14}/>} Ripristina</button><button type="button" className="trash-permanent-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={() => permanentlyDeleteVideo(item)}><Trash2 size={14}/> Elimina</button></div></div>)}</div>}</div></div>}
       {previewUrl && <div className="modal-backdrop" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><div className="share-modal video-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><X size={18}/></button><div className="section-kicker">DECIFRATO SOLO IN MEMORIA</div><h2>{previewName}</h2><div className="video-player-wrap"><video ref={videoElementRef} src={previewUrl} controls autoPlay playsInline style={{width:'100%',maxHeight:'60vh',marginTop:16,background:'#000'}}/>{!isAppleVideoDevice() && <button className="fullscreen-btn" onClick={requestVideoFullscreen}><Maximize2 size={17}/> Schermo intero</button>}</div></div></div>}
       {renameItem && <div className="modal-backdrop" onClick={() => !renameBusy && setRenameItem(null)}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => !renameBusy && setRenameItem(null)}><X size={18}/></button><div className="modal-icon"><Pencil size={21}/></div><div className="section-kicker">MODIFICA VIDEO</div><h2>Rinomina video</h2><p>Modifica il nome con cui compare nella tua libreria. Il contenuto cifrato non viene modificato.</p><form onSubmit={saveRename}><input className="rename-input" value={renameValue} onChange={e => setRenameValue(e.target.value)} maxLength={100} autoFocus placeholder="Nome del video"/><button className="primary-btn copy-btn" disabled={renameBusy}>{renameBusy ? <LoaderCircle className="spin" size={17}/> : <Check size={17}/>} Salva nome</button></form></div></div>}
       {shareItem && <div className="modal-backdrop" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><X size={18}/></button><div className="modal-icon"><Share2 size={21}/></div><div className="section-kicker">CONDIVISIONE SICURA</div><h2>Condividi questo video</h2><p>Scegli se inviare un link temporaneo oppure una copia del file, che resterà sul dispositivo di chi la riceve.</p><div className="share-file"><Film size={17}/><span>{shareItem.displayName || getDisplayName(shareItem.name)}</span></div><button className="secondary-share-btn" disabled={shareBusy} onClick={createTemporaryLink}>{shareBusy && !copyFile ? <LoaderCircle className="spin" size={16}/> : <Clock3 size={16}/>} Crea link valido 1 ora</button>{shareUrl && <><div className="share-link">{shareUrl}</div><button className="primary-btn copy-btn" onClick={copyShare}>{copied ? <><Check size={17}/> Link copiato</> : <><Copy size={17}/> Copia link</>}</button></>}<div className="share-divider">OPPURE</div><button className="primary-btn copy-btn" disabled={shareBusy} onClick={copyFile ? sendPreparedCopy : prepareCopy}>{shareBusy ? <><LoaderCircle className="spin" size={17}/> Preparo la copia…</> : copyFile ? <><Share2 size={17}/> Invia la copia</> : <><Download size={17}/> Prepara una copia da inviare</>}</button><div className="expiry-note"><ShieldCheck size={14}/> La copia inviata non dipende da Vault e non scade. Il link invece dura 60 minuti.</div></div></div>}
