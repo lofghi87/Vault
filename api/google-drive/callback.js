@@ -58,13 +58,16 @@ export default async function handler(req, res) {
     const profile = await profileResponse.json().catch(() => ({}));
     if (!profileResponse.ok || !profile.sub || !profile.email) throw new Error('Non riesco a identificare l’account Google autorizzato.');
 
-    const { data: previous, error: previousError } = await admin
+    const { data: linkedAccounts, error: linkedAccountsError } = await admin
       .from('vault_google_accounts')
-      .select('id,refresh_token_enc,folder_id')
-      .eq('user_id', pending.user_id)
-      .eq('google_sub', profile.sub)
-      .maybeSingle();
-    if (previousError) throw new Error('Non riesco a verificare un eventuale collegamento Google precedente.');
+      .select('id,google_sub,refresh_token_enc,folder_id')
+      .eq('user_id', pending.user_id);
+    if (linkedAccountsError) throw new Error('Non riesco a verificare gli account Google già collegati.');
+    const previous = (linkedAccounts || []).find(account => account.google_sub === profile.sub) || null;
+    const anotherAccount = (linkedAccounts || []).find(account => account.google_sub !== profile.sub);
+    if (anotherAccount) {
+      throw new Error('Vault consente un solo account Google Drive. Scollega prima l’account già collegato dalle impostazioni, poi riprova.');
+    }
 
     let folderId = previous?.folder_id || '';
     if (!folderId) {
