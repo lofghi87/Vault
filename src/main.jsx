@@ -1232,7 +1232,9 @@ function App() {
     const failures = [];
     let completed = 0;
     let nextIndex = 0;
-    const concurrency = Math.min(2, selected.length);
+    // I video vengono letti interamente in memoria durante la cifratura. Su iPhone/iPad, due video grandi in parallelo possono saturare la memoria e interrompere gli altri caricamenti su Drive.
+    // La coda sequenziale riduce il picco di memoria e mantiene comunque il caricamento multiplo.
+    const concurrency = 1;
 
     async function uploadOne(file, index) {
       const storedName = crypto.randomUUID() + '.vlt';
