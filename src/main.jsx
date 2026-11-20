@@ -513,6 +513,7 @@ function App() {
   const [authBusy, setAuthBusy] = useState(false);
   const [message, setMessage] = useState('');
   const [error, setError] = useState('');
+  const toastTimerRef = useRef(null);
   const [videos, setVideos] = useState([]);
   const [storageQuota, setStorageQuota] = useState(null);
   const [googleDriveQuota, setGoogleDriveQuota] = useState(null);
@@ -603,6 +604,22 @@ function App() {
       });
     }
   }, []);
+
+  useEffect(() => {
+    if (!error && !message) return;
+    if (toastTimerRef.current) window.clearTimeout(toastTimerRef.current);
+    toastTimerRef.current = window.setTimeout(() => {
+      setError('');
+      setMessage('');
+      toastTimerRef.current = null;
+    }, 6500);
+    return () => {
+      if (toastTimerRef.current) {
+        window.clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = null;
+      }
+    };
+  }, [error, message]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -2318,6 +2335,8 @@ function App() {
   if (!session) return (
     <main className="auth-page">
       <div className="auth-glow" />
+      {error && <div className="vault-toast error" role="alert"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Chiudi avviso" onClick={() => setError('')}><X size={16}/></button></div>}
+      {message && <div className="vault-toast success" role="status"><Check size={17}/><span>{message}</span><button type="button" aria-label="Chiudi avviso" onClick={() => setMessage('')}><X size={16}/></button></div>}
       <div className="auth-top"><div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div><span className="top-note"><ShieldCheck size={14}/> Spazio privato</span></div>
       <section className="auth-layout">
         <div className="auth-copy">
@@ -2340,8 +2359,7 @@ function App() {
           </form>
           {mode === 'login' && <button className="text-btn forgot" onClick={handleReset}>Hai dimenticato la password?</button>}
           <div className="auth-switch">{mode === 'login' ? 'Non hai ancora un account?' : 'Hai già un account?'} <button onClick={() => {setMode(mode === 'login' ? 'signup' : 'login');setError('');setMessage('');setVaultPassphrase('');setVaultPassphraseConfirm('');}}>{mode === 'login' ? 'Registrati' : 'Accedi'}</button></div>
-          {error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}
-          {message && <div className="notice success"><Check size={16}/>{message}</div>}
+
           <div className="auth-foot"><LockKeyhole size={13}/> Le tue credenziali non vengono mostrate né condivise.</div>
         </div>
       </section>
@@ -2350,11 +2368,13 @@ function App() {
   );
 
   if (!vaultKey) return (
-    <main className="auth-page"><div className="auth-glow"/><div className="auth-top"><div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div><button className="text-btn" onClick={handleLogout}>Esci</button></div><section className="auth-layout" style={{display:'flex',justifyContent:'center'}}><div className="auth-card" style={{width:'min(100%,440px)'}}><div className="card-lock"><KeyRound size={22}/></div><h2>Sblocca la cifratura</h2><p className="card-sub">Inserisci la tua frase segreta Vault. Non viene inviata né salvata sui server. Usa la stessa frase su ogni dispositivo.</p><form onSubmit={unlockVault}><label>Frase segreta (almeno 12 caratteri)</label><div className="input-wrap"><KeyRound size={17}/><input type={showVaultPassphrase ? 'text' : 'password'} value={vaultPassphrase} onChange={e => setVaultPassphrase(e.target.value)} autoComplete="off" minLength={12} required placeholder="La tua frase segreta"/><button className="eye-btn" type="button" onClick={() => setShowVaultPassphrase(v => !v)} aria-label="Mostra frase segreta">{showVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><button className="primary-btn auth-submit" disabled={unlockBusy}>{unlockBusy ? <LoaderCircle className="spin" size={18}/> : 'Sblocca Vault'}</button></form>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}<div className="auth-foot"><ShieldCheck size={13}/> Se dimentichi la frase segreta, i video cifrati non si possono recuperare.</div></div></section></main>
+    <main className="auth-page"><div className="auth-glow"/>{error && <div className="vault-toast error" role="alert"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Chiudi avviso" onClick={() => setError('')}><X size={16}/></button></div>}{message && <div className="vault-toast success" role="status"><Check size={17}/><span>{message}</span><button type="button" aria-label="Chiudi avviso" onClick={() => setMessage('')}><X size={16}/></button></div>}<div className="auth-top"><div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div><button className="text-btn" onClick={handleLogout}>Esci</button></div><section className="auth-layout" style={{display:'flex',justifyContent:'center'}}><div className="auth-card" style={{width:'min(100%,440px)'}}><div className="card-lock"><KeyRound size={22}/></div><h2>Sblocca la cifratura</h2><p className="card-sub">Inserisci la tua frase segreta Vault. Non viene inviata né salvata sui server. Usa la stessa frase su ogni dispositivo.</p><form onSubmit={unlockVault}><label>Frase segreta (almeno 12 caratteri)</label><div className="input-wrap"><KeyRound size={17}/><input type={showVaultPassphrase ? 'text' : 'password'} value={vaultPassphrase} onChange={e => setVaultPassphrase(e.target.value)} autoComplete="off" minLength={12} required placeholder="La tua frase segreta"/><button className="eye-btn" type="button" onClick={() => setShowVaultPassphrase(v => !v)} aria-label="Mostra frase segreta">{showVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><button className="primary-btn auth-submit" disabled={unlockBusy}>{unlockBusy ? <LoaderCircle className="spin" size={18}/> : 'Sblocca Vault'}</button></form><div className="auth-foot"><ShieldCheck size={13}/> Se dimentichi la frase segreta, i video cifrati non si possono recuperare.</div></div></section></main>
   );
 
   return (
     <main className="dashboard">
+      {error && <div className="vault-toast error" role="alert"><AlertCircle size={17}/><span>{error}</span><button type="button" aria-label="Chiudi avviso" onClick={() => setError('')}><X size={16}/></button></div>}
+      {message && <div className="vault-toast success" role="status"><Check size={17}/><span>{message}</span><button type="button" aria-label="Chiudi avviso" onClick={() => setMessage('')}><X size={16}/></button></div>}
       <header className="dash-header">
         <div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div>
         <div className="header-right"><span className="secure-pill"><span className={'pulse-dot ' + (securityState === 'weak' ? 'pulse-dot-warning' : '')}/>{securityState === 'weak' ? 'DA VERIFICARE' : securityState === 'check' ? 'METADATI DA VERIFICARE' : securityState === 'unknown' ? 'ARCHIVIO IN ATTESA' : 'ARCHIVIO CIFRATO'}</span><button className="icon-btn settings-gear-btn" onClick={() => {setError('');setMessage('');setSettingsHubOpen(true);}} title="Impostazioni" aria-label="Apri impostazioni"><Settings size={19}/></button><button className="icon-btn" onClick={handleLogout} title="Esci" aria-label="Esci"><LogOut size={18}/></button></div>
@@ -2391,7 +2411,7 @@ function App() {
       <input ref={uploadInputRef} type="file" accept="video/*" multiple hidden onChange={handleUpload}/>
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
       {uploadDestinationOpen && <div className="modal-backdrop" onClick={() => setUploadDestinationOpen(false)}><div className="share-modal upload-destination-modal" onClick={event => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setUploadDestinationOpen(false)} aria-label="Chiudi"><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">NUOVO CARICAMENTO</div><h2>Dove vuoi salvarlo?</h2><p>Scegli la destinazione per questo caricamento. Il video verrà cifrato sul dispositivo prima del trasferimento.</p><div className="upload-destination-options"><button className="upload-destination-option" type="button" disabled={integrityChecking || Boolean(trashActionId)} onClick={() => chooseUploadDestination('backblaze')}><span className="upload-destination-icon"><ShieldCheck size={20}/></span><span><b>Backblaze B2</b><small>Spazio personale Vault</small></span><ArrowUpRight size={17}/></button>{googleAccounts.map(account => <button className="upload-destination-option" type="button" key={account.id} disabled={account.status === 'error' || integrityChecking || Boolean(trashActionId)} onClick={() => chooseUploadDestination('google:' + account.id)}><span className="upload-destination-icon"><HardDrive size={20}/></span><span><b>Google Drive</b><small>{account.status === 'error' ? 'Account da ricollegare' : account.email}</small></span>{account.status === 'error' ? <AlertCircle size={17}/> : <ArrowUpRight size={17}/>}</button>)}</div>{googleAccounts.length === 0 && <button className="secondary-share-btn" type="button" onClick={() => {setUploadDestinationOpen(false);setStorageOpen(true);}}><HardDrive size={16}/> Collega Google Drive</button>}</div></div>}
-      {error && <div className="notice error dashboard-notice"><AlertCircle size={16}/>{error}<button onClick={() => setError('')}><X size={15}/></button></div>}
+
       {activeSection === 'overview' && (
         <section className="vault-overview" aria-label="Panoramica dello spazio e della sicurezza">
           <div className="overview-storage-grid">
@@ -2563,7 +2583,7 @@ function App() {
       </section>
       )}
       <footer className="dash-footer"><span><ShieldCheck size={14}/> I video sono cifrati sul dispositivo prima del salvataggio nella destinazione scelta.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
-      {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
+
       {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {if (integrityChecking) {setMessage('Attendi il termine del controllo di integrità.'); return;} setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
       {storageOpen && <div className="modal-backdrop" onClick={() => {if (!googleConnectBusy && !uploading) {setStorageOpen(false);setSettingsHubOpen(true);}}}><div className="share-modal settings-detail-modal" onClick={e => e.stopPropagation()}><button className="modal-back-btn" type="button" aria-label="Torna alle impostazioni" title="Torna alle impostazioni" disabled={googleConnectBusy || uploading} onClick={() => {setStorageOpen(false);setSettingsHubOpen(true);}}><ArrowLeft size={19}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI ARCHIVIAZIONE</div><h2>Destinazione dei video</h2><p>Scegli dove salvare i prossimi video e gestisci gli account collegati.</p>
       <section className="storage-panel">
