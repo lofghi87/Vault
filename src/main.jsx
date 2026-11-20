@@ -1230,6 +1230,7 @@ function App() {
     setMessage('');
     const uploadedDriveItems = [];
     const failures = [];
+    const metadataWarnings = [];
     let completed = 0;
     let nextIndex = 0;
     // I video vengono letti interamente in memoria durante la cifratura. Su iPhone/iPad, due video grandi in parallelo possono saturare la memoria e interrompere gli altri caricamenti su Drive.
@@ -1268,7 +1269,7 @@ function App() {
             }, vaultKey);
           } catch (metadataError) {
             console.warn('Video salvato su Google Drive, ma metadati non salvati:', metadataError);
-            failures.push(file.name + ': video salvato, ma dettagli non sincronizzati (' + (metadataError.message || 'errore metadati') + ')');
+            metadataWarnings.push(file.name + ': video salvato, ma nome e dettagli non sincronizzati (' + (metadataError.message || 'errore metadati') + ')');
           }
           await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
         } else {
@@ -1312,12 +1313,16 @@ function App() {
       }
     }
 
+    const successfulUploads = selected.length - failures.length;
     if (failures.length) {
-      setError('Caricamento terminato: ' + (selected.length - failures.length) + ' di ' + selected.length + ' video caricati. Errori: ' + failures.slice(0, 3).join(' · '));
+      setError('Caricamento terminato: ' + successfulUploads + ' di ' + selected.length + ' video caricati. Errori reali di caricamento: ' + failures.slice(0, 3).join(' · '));
     } else {
-      setMessage(selected.length === 1
+      const successText = selected.length === 1
         ? 'Video caricato e cifrato correttamente.'
-        : 'Tutti e ' + selected.length + ' video sono stati caricati e cifrati correttamente.');
+        : 'Tutti e ' + selected.length + ' video sono stati caricati e cifrati correttamente.';
+      setMessage(metadataWarnings.length
+        ? successText + ' Attenzione: alcuni nomi o dettagli non sono stati sincronizzati: ' + metadataWarnings.slice(0, 3).join(' · ')
+        : successText);
     }
   }
 
