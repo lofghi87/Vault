@@ -204,13 +204,15 @@ function isOpaqueVaultName(name) {
 
 function UsageBar({ segments, totalBytes, label }) {
   const total = Number(totalBytes || 0);
+  const segmentTotal = segments.reduce((sum, segment) => sum + Math.max(0, Number(segment.bytes) || 0), 0);
+  const denominator = Math.max(total, segmentTotal);
   return (
     <div className="usage-bar" role="img" aria-label={label}>
-      {total > 0 && segments.filter(segment => Number(segment.bytes) > 0).map(segment => (
+      {denominator > 0 && segments.filter(segment => Number(segment.bytes) > 0).map(segment => (
         <span
           key={segment.label}
           className={'usage-segment ' + segment.className}
-          style={{ width: Math.min(100, Number(segment.bytes) / total * 100) + '%' }}
+          style={{ width: Math.max(0, Number(segment.bytes)) / denominator * 100 + '%' }}
           title={segment.label}
         />
       ))}
@@ -1689,15 +1691,19 @@ function App() {
                 <>
                   <div className="overview-account-email">{googleAccounts[0].email}</div>
                   <div className="overview-usage-number"><strong>{formatSize(driveTotalUsedBytes)}</strong><span>{driveLimitBytes == null ? 'utilizzati · quota totale non comunicata' : 'di ' + formatSize(driveLimitBytes) + ' utilizzati'}</span></div>
-                  <UsageBar
-                    totalBytes={driveLimitBytes || driveTotalUsedBytes}
-                    label={'Account Google: ' + formatSize(driveTotalUsedBytes) + ' utilizzati' + (driveLimitBytes == null ? '' : ' su ' + formatSize(driveLimitBytes))}
-                    segments={[
-                      { label: 'Video Vault', bytes: driveVideoSegment, className: 'usage-vault' },
-                      ...(hasDriveBreakdown ? [{ label: 'Altri file Drive', bytes: driveOtherFilesSegment, className: 'usage-other' }] : []),
-                      { label: hasDriveBreakdown ? 'Altri dati Google' : 'Altri dati account Google', bytes: otherGoogleSegment, className: 'usage-google' },
-                    ]}
-                  />
+                  {driveLimitBytes != null ? (
+                    <UsageBar
+                      totalBytes={driveLimitBytes}
+                      label={'Account Google: ' + formatSize(driveTotalUsedBytes) + ' utilizzati su ' + formatSize(driveLimitBytes)}
+                      segments={[
+                        { label: 'Video Vault', bytes: driveVideoSegment, className: 'usage-vault' },
+                        ...(hasDriveBreakdown ? [{ label: 'Altri file Drive', bytes: driveOtherFilesSegment, className: 'usage-other' }] : []),
+                        { label: hasDriveBreakdown ? 'Altri dati Google' : 'Altri dati account Google', bytes: otherGoogleSegment, className: 'usage-google' },
+                      ]}
+                    />
+                  ) : (
+                    <div className="overview-no-quota">Google non comunica il limite complessivo: la percentuale di spazio occupato non è calcolabile.</div>
+                  )}
                   <div className="overview-legend">
                     <div><span className="legend-dot usage-vault"/><span>Video salvati da Vault</span><b>{formatSize(driveVideoSegment)}</b></div>
                     {hasDriveBreakdown && <div><span className="legend-dot usage-other"/><span>Altri file personali su Drive</span><b>{formatSize(driveOtherFilesSegment)}</b></div>}
