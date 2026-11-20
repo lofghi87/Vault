@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
-import { LockKeyhole, ShieldCheck, ShieldAlert, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings, RefreshCw } from 'lucide-react';
+import { LockKeyhole, ShieldCheck, ShieldAlert, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, ArrowLeft, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings, RefreshCw } from 'lucide-react';
 import './styles.css';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -97,20 +97,30 @@ async function googleDownload(session, accountId, fileId, size) {
 }
 
 async function googleUpload(session, accountId, name, encryptedBlob) {
-  const started = await googleRequest(session, {
-    action: 'startUpload', accountId, name, size: encryptedBlob.size,
-  });
+  let started;
+  try {
+    started = await googleRequest(session, {
+      action: 'startUpload', accountId, name, size: encryptedBlob.size,
+    });
+  } catch (error) {
+    throw new Error('Avvio della sessione Google Drive non riuscito: ' + (error?.message || 'errore di rete'));
+  }
   if (!started.uploadUrl) throw new Error('Google Drive non ha preparato il caricamento.');
-  const chunkSize = 8 * 1024 * 1024; // Multiplo di 256 KB, adatto ai video di grandi dimensioni.
+  const chunkSize = 4 * 1024 * 1024; // Multiplo di 256 KB; blocchi più piccoli sono più gestibili su Safari/iOS.
   let offset = 0;
   let uploaded = null;
 
   const probeUpload = async () => {
-    const response = await fetch(started.uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Range': 'bytes */' + encryptedBlob.size },
-      body: new Blob([]),
-    });
+    let response;
+    try {
+      response = await fetch(started.uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Range': 'bytes */' + encryptedBlob.size },
+        body: new Blob([]),
+      });
+    } catch (error) {
+      throw new Error('Controllo dello stato della sessione Google Drive non riuscito: ' + (error?.message || 'errore di rete'));
+    }
     if (response.status === 200 || response.status === 201) {
       return { nextOffset: encryptedBlob.size, uploaded: await response.json().catch(() => ({})) };
     }
@@ -135,8 +145,18 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
         },
         body: chunk,
       });
-    } catch {
-      const progress = await probeUpload();
+    } catch (networkError) {
+      let progress;
+      try {
+        progress = await probeUpload();
+      } catch (probeError) {
+        throw new Error(
+          'Connessione durante il trasferimento verso Google Drive non riuscita: ' +
+          (networkError?.message || 'errore di rete') +
+          '. Anche il controllo del caricamento è fallito: ' +
+          (probeError?.message || 'errore di verifica')
+        );
+      }
       if (progress.uploaded) {
         uploaded = progress.uploaded;
         offset = encryptedBlob.size;
@@ -187,9 +207,14 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
   }
   if (!uploaded?.id) throw new Error('Google Drive non ha confermato il completamento del caricamento.');
 
-  const verified = await googleRequest(session, {
-    action: 'verify', accountId, fileId: uploaded.id, expectedSize: encryptedBlob.size,
-  });
+  let verified;
+  try {
+    verified = await googleRequest(session, {
+      action: 'verify', accountId, fileId: uploaded.id, expectedSize: encryptedBlob.size,
+    });
+  } catch (error) {
+    throw new Error('Google Drive ha ricevuto il video, ma Vault non è riuscito a verificarlo tramite il server: ' + (error?.message || 'errore di rete'));
+  }
   return verified.data;
 }
 
@@ -348,9 +373,36 @@ async function deriveVaultKey(passphrase, userId) {
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: new TextEncoder().encode('VAULT-v1:' + userId), iterations: 310000, hash: 'SHA-256' }, material, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
 }
 
+async function readSelectedFile(file) {
+  try {
+    return await file.arrayBuffer();
+  } catch (arrayBufferError) {
+    // Safari su iOS può fallire nella lettura diretta di alcuni file selezionati da Foto/File.
+    // FileReader usa il percorso di lettura tradizionale del browser come fallback.
+    try {
+      return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+          else reject(new Error('Il dispositivo non ha restituito i dati del video.'));
+        };
+        reader.onerror = () => reject(reader.error || new Error('Lettura del file non riuscita.'));
+        reader.onabort = () => reject(new Error('Lettura del file interrotta.'));
+        reader.readAsArrayBuffer(file);
+      });
+    } catch (fileReaderError) {
+      throw new Error(
+        'Il dispositivo non riesce a leggere il file selezionato. ArrayBuffer: ' +
+        (arrayBufferError?.message || 'errore di lettura') +
+        '; FileReader: ' + (fileReaderError?.message || 'errore di lettura')
+      );
+    }
+  }
+}
+
 async function encryptVideo(file, key) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = await file.arrayBuffer();
+  const plain = await readSelectedFile(file);
   const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
   return new Blob([new Uint8Array([86, 76, 84, 49]), iv, cipher], { type: 'application/octet-stream' });
 }
@@ -1231,6 +1283,7 @@ function App() {
     const uploadedDriveItems = [];
     const failures = [];
     const metadataWarnings = [];
+    const recoveryWarnings = [];
     let completed = 0;
     let nextIndex = 0;
     // I video vengono letti interamente in memoria durante la cifratura. Su iPhone/iPad, due video grandi in parallelo possono saturare la memoria e interrompere gli altri caricamenti su Drive.
@@ -1240,8 +1293,13 @@ function App() {
     async function uploadOne(file, index) {
       const storedName = crypto.randomUUID() + '.vlt';
       const path = session.user.id + '/Vault/' + storedName;
+      let encrypted = null;
       try {
-        const encrypted = await encryptVideo(file, vaultKey);
+        try {
+          encrypted = await encryptVideo(file, vaultKey);
+        } catch (readError) {
+          throw new Error('Lettura e cifratura sul dispositivo: ' + (readError?.message || 'errore durante la lettura del video'));
+        }
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
           const drivePath = 'google:' + googleAccountId + ':' + saved.id;
@@ -1281,7 +1339,59 @@ function App() {
           await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
         }
       } catch (uploadError) {
-        failures.push(file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
+        let recoveredFromDrive = false;
+        let recoveryError = null;
+
+        // Se la connessione si interrompe dopo che Drive ha ricevuto tutti i byte,
+        // la risposta del browser può andare persa. Cerchiamo il nome UUID univoco
+        // nella cartella Vault prima di dichiarare il file non caricato.
+        if (isGoogleDestination && encrypted) {
+          try {
+            const listed = await googleRequest(session, { action: 'list', accountId: googleAccountId });
+            const matchingFile = (listed.data || []).find(file =>
+              file.name === storedName &&
+              (!Number(file.size || 0) || Number(file.size) === encrypted.size)
+            );
+            if (matchingFile) {
+              const drivePath = 'google:' + googleAccountId + ':' + matchingFile.id;
+              uploadedDriveItems.push({
+                id: 'google-' + googleAccountId + '-' + matchingFile.id,
+                fileId: matchingFile.id,
+                accountId: googleAccountId,
+                accountEmail: googleAccount.email,
+                path: drivePath,
+                name: matchingFile.name || storedName,
+                displayName: file.name || getDisplayName(matchingFile.name || storedName),
+                size: Number(matchingFile.size || encrypted.size),
+                created_at: matchingFile.created_at || new Date().toISOString(),
+                mime: file.type || getOriginalVideoMime(file.name),
+                encrypted: true,
+                provider: 'google',
+                providerLabel: 'Google Drive · ' + googleAccount.email,
+              });
+              try {
+                await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), {
+                  name: file.name,
+                  mime: file.type || getOriginalVideoMime(file.name),
+                }, vaultKey);
+              } catch (metadataError) {
+                metadataWarnings.push(file.name + ': ' + (metadataError.message || 'metadati non sincronizzati'));
+              }
+              await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato salvato su Google Drive e recuperato dopo una risposta di rete interrotta · ' + googleAccount.email);
+              recoveryWarnings.push(file.name + ': Google Drive aveva già salvato il video; Vault ha recuperato la conferma.');
+              recoveredFromDrive = true;
+            }
+          } catch (reconcileError) {
+            recoveryError = reconcileError?.message || 'non è stato possibile verificare la cartella Drive';
+          }
+        }
+
+        if (!recoveredFromDrive) {
+          failures.push(
+            file.name + ': ' + (uploadError.message || 'errore sconosciuto') +
+            (recoveryError ? ' · verifica su Drive non riuscita: ' + recoveryError : '')
+          );
+        }
       } finally {
         completed++;
         setProgressName(completed + ' di ' + selected.length + ' completati · ' + file.name);
@@ -1314,14 +1424,15 @@ function App() {
     }
 
     const successfulUploads = selected.length - failures.length;
+    const warnings = [...recoveryWarnings, ...metadataWarnings];
     if (failures.length) {
-      setError('Caricamento terminato: ' + successfulUploads + ' di ' + selected.length + ' video caricati. Errori reali di caricamento: ' + failures.slice(0, 3).join(' · '));
+      setError('Caricamento terminato: ' + successfulUploads + ' di ' + selected.length + ' video salvati. Dettagli: ' + failures.slice(0, 3).join(' · '));
     } else {
       const successText = selected.length === 1
         ? 'Video caricato e cifrato correttamente.'
         : 'Tutti e ' + selected.length + ' video sono stati caricati e cifrati correttamente.';
-      setMessage(metadataWarnings.length
-        ? successText + ' Attenzione: alcuni nomi o dettagli non sono stati sincronizzati: ' + metadataWarnings.slice(0, 3).join(' · ')
+      setMessage(warnings.length
+        ? successText + ' Avvisi: ' + warnings.slice(0, 3).join(' · ')
         : successText);
     }
   }
