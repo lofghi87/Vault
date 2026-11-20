@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
-import { LockKeyhole, ShieldCheck, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings } from 'lucide-react';
+import { LockKeyhole, ShieldCheck, ShieldAlert, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings, RefreshCw } from 'lucide-react';
 import './styles.css';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -1612,7 +1612,7 @@ function App() {
     <main className="dashboard">
       <header className="dash-header">
         <div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div>
-        <div className="header-right"><span className="secure-pill"><span className={'pulse-dot ' + (securityState === 'weak' ? 'pulse-dot-warning' : '')}/>{securityState === 'weak' ? 'DA VERIFICARE' : securityState === 'unknown' ? 'ARCHIVIO IN ATTESA' : 'ARCHIVIO CIFRATO'}</span><button className="icon-btn settings-gear-btn" onClick={() => {setError('');setMessage('');setSettingsHubOpen(true);}} title="Impostazioni" aria-label="Apri impostazioni"><Settings size={19}/></button><button className="icon-btn" onClick={handleLogout} title="Esci" aria-label="Esci"><LogOut size={18}/></button></div>
+        <div className="header-right"><span className="secure-pill"><span className={'pulse-dot ' + (securityState === 'weak' ? 'pulse-dot-warning' : '')}/>{securityState === 'weak' ? 'DA VERIFICARE' : securityState === 'check' ? 'METADATI DA VERIFICARE' : securityState === 'unknown' ? 'ARCHIVIO IN ATTESA' : 'ARCHIVIO CIFRATO'}</span><button className="icon-btn settings-gear-btn" onClick={() => {setError('');setMessage('');setSettingsHubOpen(true);}} title="Impostazioni" aria-label="Apri impostazioni"><Settings size={19}/></button><button className="icon-btn" onClick={handleLogout} title="Esci" aria-label="Esci"><LogOut size={18}/></button></div>
       </header>
       <nav className="vault-navigation" aria-label="Sezioni di Vault">
         <button type="button" className={'vault-nav-tab ' + (activeSection === 'gallery' ? 'active' : '')} onClick={() => setActiveSection('gallery')} aria-current={activeSection === 'gallery' ? 'page' : undefined}>
