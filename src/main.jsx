@@ -1721,6 +1721,10 @@ function App() {
             detail: itemError.message || 'Errore durante il controllo.',
             checkedAt: new Date().toISOString(),
           });
+          setVideos(current => current.map(video => video.id === item.id
+            ? { ...video, integrityLastStatus: 'error' }
+            : video
+          ));
         }
         setIntegrityResults([...results]);
       }
@@ -1989,6 +1993,10 @@ function App() {
             detail: checkError.message || 'Errore durante il controllo automatico.',
             checkedAt: new Date().toISOString(),
           }]);
+          setVideos(current => current.map(video => video.id === candidate.id
+            ? { ...video, integrityLastStatus: 'error' }
+            : video
+          ));
           setError('Controllo automatico non completato: ' + (checkError.message || 'errore sconosciuto') + '. Puoi riprovare da Panoramica.');
         }
       } finally {
