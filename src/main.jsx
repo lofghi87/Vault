@@ -774,7 +774,7 @@ function App() {
   }
 
   async function protectExistingVideoNames() {
-    if (!session?.user?.id || !vaultKey || metadataMigrationBusy || rotationBusy) return;
+    if (!session?.user?.id || !vaultKey || metadataMigrationBusy || rotationBusy || integrityChecking) return;
     const candidates = videos.filter(item => !item.trashedAt && item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\.vlt$/i.test(item.name || ''));
     if (!candidates.length) {
       setMetadataMigrationProgress('Non risultano nomi legacy da proteggere nella libreria caricata.');
@@ -855,7 +855,7 @@ function App() {
 
   async function changeVaultPassphrase(event) {
     event.preventDefault();
-    if (!vaultKey || !session?.user?.id) return;
+    if (integrityChecking || trashActionId || !vaultKey || !session?.user?.id) return;
     if (!currentVaultPassphrase) { setError('Inserisci la frase segreta attuale.'); return; }
     const enteredOldKey = await deriveVaultKey(currentVaultPassphrase, session.user.id);
     const [enteredOldRaw, activeRaw] = await Promise.all([crypto.subtle.exportKey('raw', enteredOldKey), crypto.subtle.exportKey('raw', vaultKey)]);
@@ -1082,6 +1082,10 @@ function App() {
   }
 
   async function disconnectGoogleDrive(account) {
+    if (integrityChecking) {
+      setMessage('Attendi il termine del controllo di integrità prima di modificare gli account cloud.');
+      return;
+    }
     if (!account?.id || googleDisconnectId) return;
     const confirmed = window.confirm(
       'Vuoi scollegare ' + account.email + ' da Vault? I video resteranno nel suo Google Drive, ma non saranno più visibili in Vault finché non ricollegherai lo stesso account.'
@@ -1312,7 +1316,7 @@ function App() {
 
   async function saveRename(event) {
     event.preventDefault();
-    if (!renameItem || !session?.user?.id) return;
+    if (integrityChecking || trashActionId || !renameItem || !session?.user?.id) return;
     const clean = renameValue.trim().normalize('NFKC').replace(/[\/\\]/g, '-').replace(/[<>:"|?*]/g, '-').replace(/\s+/g, ' ').slice(0, 100);
     if (!clean) { setError('Inserisci un nome valido.'); return; }
     if (!renameItem.encrypted) { setError('Puoi rinominare solo i video cifrati.'); return; }
@@ -1376,7 +1380,7 @@ function App() {
   }
 
   async function createTemporaryLink() {
-    if (!shareItem || !session?.user?.id) return;
+    if (integrityChecking || trashActionId || !shareItem || !session?.user?.id) return;
     setShareBusy(true);
     setError('');
     let sharePath = '';
@@ -1424,7 +1428,7 @@ function App() {
   }
 
   async function prepareCopy() {
-    if (!shareItem) return;
+    if (integrityChecking || trashActionId || !shareItem) return;
     setShareBusy(true);
     setError('');
     try {
@@ -1931,12 +1935,13 @@ function App() {
     automaticIntegrityStartedRef.current = true;
     let cancelled = false;
     let started = false;
-    setIntegrityChecking(true);
-    setIntegrityProgress('Controllo automatico programmato: ' + (candidate.displayName || getDisplayName(candidate.name)));
+    setIntegrityProgress('Controllo automatico in coda: ' + (candidate.displayName || getDisplayName(candidate.name)));
     const timer = window.setTimeout(async () => {
       started = true;
       automaticIntegrityTimerRef.current = null;
       if (cancelled) return;
+      setIntegrityChecking(true);
+      setIntegrityProgress('Controllo automatico: ' + (candidate.displayName || getDisplayName(candidate.name)));
       try {
         const checked = await verifyVideoIntegrity(candidate);
         if (cancelled) return;
@@ -1980,11 +1985,9 @@ function App() {
       cancelled = true;
       window.clearTimeout(timer);
       if (automaticIntegrityTimerRef.current === timer) automaticIntegrityTimerRef.current = null;
-      if (!started) {
-        automaticIntegrityStartedRef.current = false;
-        setIntegrityChecking(false);
-        setIntegrityProgress('');
-      }
+      if (!started) automaticIntegrityStartedRef.current = false;
+      if (started) setIntegrityChecking(false);
+      setIntegrityProgress('');
     };
   }, [session?.user?.id, vaultKey, loadingVideos]);
 
@@ -2197,7 +2200,7 @@ function App() {
                 <div>
                   <span className="overview-eyebrow">CONTROLLO DEI CONTENUTI</span>
                   <h3>Integrità dei video</h3>
-                  <p>Confronta i file cifrati con le impronte SHA-256 conservate nei metadati cifrati di Vault. In automatico controlla un video da verificare per ogni sblocco e ricontrolla ogni video almeno ogni 30 giorni; puoi avviare una verifica completa quando preferisci.</p>
+                  <p>Confronta i file cifrati con le impronte SHA-256 conservate nei metadati cifrati di Vault. In automatico controlla un video ancora senza impronta o con un controllo vecchio di almeno 30 giorni a ogni sblocco; puoi avviare una verifica completa quando preferisci.</p>
                 </div>
                 <button
                   className="overview-refresh-btn"
@@ -2257,7 +2260,7 @@ function App() {
       )}
       <footer className="dash-footer"><span><ShieldCheck size={14}/> I video sono cifrati sul dispositivo prima del salvataggio nella destinazione scelta.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
       {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
-      {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
+      {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {if (integrityChecking) {setMessage('Attendi il termine del controllo di integrità.'); return;} setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
       {storageOpen && <div className="modal-backdrop" onClick={() => !googleConnectBusy && !uploading && setStorageOpen(false)}><div className="share-modal settings-detail-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !googleConnectBusy && !uploading && setStorageOpen(false)}><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI ARCHIVIAZIONE</div><h2>Destinazione dei video</h2><p>Scegli dove salvare i prossimi video e gestisci gli account collegati.</p>
       <section className="storage-panel">
         <div className="storage-panel-head">
