@@ -88,6 +88,8 @@ export default async function handler(req, res) {
       return send(res, 200, { data: {
         limitBytes,
         usedBytes,
+        driveUsedBytes: result.storageQuota.usageInDrive == null ? null : Number(result.storageQuota.usageInDrive),
+        driveTrashBytes: result.storageQuota.usageInDriveTrash == null ? null : Number(result.storageQuota.usageInDriveTrash),
         availableBytes: limitBytes == null ? null : Math.max(0, limitBytes - usedBytes),
       } });
     }

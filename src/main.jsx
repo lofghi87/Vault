@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
-import { LockKeyhole, ShieldCheck, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings } from 'lucide-react';
+import { LockKeyhole, ShieldCheck, ShieldAlert, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings, RefreshCw } from 'lucide-react';
 import './styles.css';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -197,6 +197,29 @@ function getDisplayName(name) {
   return name.replace(/^[0-9a-f-]{30,}-/i, '').replace(/\.vlt$/i, '');
 }
 
+function isOpaqueVaultName(name) {
+  const fileName = String(name || '').split('/').pop();
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\.vlt$/i.test(fileName);
+}
+
+function UsageBar({ segments, totalBytes, label }) {
+  const total = Number(totalBytes || 0);
+  const segmentTotal = segments.reduce((sum, segment) => sum + Math.max(0, Number(segment.bytes) || 0), 0);
+  const denominator = Math.max(total, segmentTotal);
+  return (
+    <div className="usage-bar" role="img" aria-label={label}>
+      {denominator > 0 && segments.filter(segment => Number(segment.bytes) > 0).map(segment => (
+        <span
+          key={segment.label}
+          className={'usage-segment ' + segment.className}
+          style={{ width: Math.max(0, Number(segment.bytes)) / denominator * 100 + '%' }}
+          title={segment.label}
+        />
+      ))}
+    </div>
+  );
+}
+
 function metadataStoragePath(userId, storagePath) {
   if (typeof storagePath === 'string' && storagePath.startsWith('google:')) {
     const [, accountId, fileId] = storagePath.split(':');
@@ -388,6 +411,8 @@ function App() {
   const [googleConnectBusy, setGoogleConnectBusy] = useState(false);
   const [googleDisconnectId, setGoogleDisconnectId] = useState('');
   const [loadingVideos, setLoadingVideos] = useState(false);
+  const [activeSection, setActiveSection] = useState('gallery');
+  const [dataUpdatedAt, setDataUpdatedAt] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [progressName, setProgressName] = useState('');
   const [shareItem, setShareItem] = useState(null);
@@ -615,6 +640,7 @@ function App() {
       console.warn('Contatore spazio Vault non aggiornato:', quotaError);
       setStorageQuota(null);
     }
+    setDataUpdatedAt(new Date().toISOString());
     setLoadingVideos(false);
   }, [session, vaultKey]);
 
@@ -1480,7 +1506,45 @@ function App() {
       }
     });
   }, [notificationsEnabled, shares, nowTick]);
-  const totalBytes = videos.filter(item => item.provider !== 'google').reduce((sum, item) => sum + item.size, 0);
+  const backblazeVideoBytes = videos.filter(item => item.provider !== 'google').reduce((sum, item) => sum + Number(item.size || 0), 0);
+  const driveVideoBytes = videos.filter(item => item.provider === 'google').reduce((sum, item) => sum + Number(item.size || 0), 0);
+  const backblazeUsedBytes = Number(storageQuota?.usedBytes || 0);
+  const backblazeLimitBytes = Number(storageQuota?.personalLimitBytes || 2_000_000_000);
+  const backblazeVideoSegment = Math.min(backblazeVideoBytes, backblazeUsedBytes);
+  const backblazeOtherSegment = Math.max(0, backblazeUsedBytes - backblazeVideoSegment);
+  const driveTotalUsedBytes = Number(googleDriveQuota?.usedBytes || 0);
+  const driveLimitBytes = googleDriveQuota?.limitBytes == null ? null : Number(googleDriveQuota.limitBytes);
+  const hasDriveBreakdown = googleDriveQuota?.driveUsedBytes != null && Number.isFinite(Number(googleDriveQuota.driveUsedBytes));
+  const driveStorageUsedBytes = hasDriveBreakdown ? Math.max(0, Number(googleDriveQuota.driveUsedBytes)) : driveTotalUsedBytes;
+  const driveVideoSegment = Math.min(driveVideoBytes, driveTotalUsedBytes);
+  const driveOtherFilesSegment = hasDriveBreakdown
+    ? Math.min(Math.max(0, driveStorageUsedBytes - driveVideoSegment), Math.max(0, driveTotalUsedBytes - driveVideoSegment))
+    : 0;
+  const otherGoogleSegment = hasDriveBreakdown
+    ? Math.max(0, driveTotalUsedBytes - driveVideoSegment - driveOtherFilesSegment)
+    : Math.max(0, driveTotalUsedBytes - driveVideoSegment);
+  const unencryptedVideoCount = videos.filter(item => !item.encrypted).length;
+  const visibleStorageNameCount = videos.filter(item => !isOpaqueVaultName(item.name)).length;
+  const missingMetadataCount = videos.filter(item => item.encrypted && !item.encryptedMetadata).length;
+  const activeLinkCount = shares.filter(share => !share.revoked_at && new Date(share.expires_at).getTime() > nowTick).length;
+  const securityState = !videos.length
+    ? 'unknown'
+    : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0)
+      ? 'weak'
+      : missingMetadataCount > 0
+        ? 'check'
+        : 'good';
+  const securityReasons = [];
+  if (unencryptedVideoCount > 0) securityReasons.push(unencryptedVideoCount + ' video non risultano cifrati (non hanno il formato .vlt).');
+  if (visibleStorageNameCount > 0) securityReasons.push(visibleStorageNameCount + ' file hanno ancora un nome riconoscibile nello spazio cloud.');
+  if (missingMetadataCount > 0) securityReasons.push('I metadati cifrati del titolo non sono disponibili per ' + missingMetadataCount + ' video.');
+  const securitySummary = securityState === 'good'
+    ? 'I video elencati risultano cifrati e salvati con nomi casuali.'
+    : securityState === 'weak'
+      ? 'Ci sono elementi da proteggere: controlla i motivi indicati qui sotto.'
+      : securityState === 'check'
+        ? 'La cifratura e i nomi risultano protetti, ma alcuni titoli non sono stati verificati.'
+        : 'Non ci sono ancora video da analizzare.';
   const formatSize = bytes => bytes < 1_000_000
     ? (bytes / 1_000).toFixed(0) + ' KB'
     : bytes < 1_000_000_000
@@ -1550,25 +1614,153 @@ function App() {
     <main className="dashboard">
       <header className="dash-header">
         <div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div>
-        <div className="header-right"><span className="secure-pill"><span className="pulse-dot"/> ARCHIVIO PROTETTO</span><button className="icon-btn settings-gear-btn" onClick={() => {setError('');setMessage('');setSettingsHubOpen(true);}} title="Impostazioni" aria-label="Apri impostazioni"><Settings size={19}/></button><button className="icon-btn" onClick={handleLogout} title="Esci" aria-label="Esci"><LogOut size={18}/></button></div>
+        <div className="header-right"><span className="secure-pill"><span className={'pulse-dot ' + (securityState === 'weak' ? 'pulse-dot-warning' : '')}/>{securityState === 'weak' ? 'DA VERIFICARE' : securityState === 'check' ? 'METADATI DA VERIFICARE' : securityState === 'unknown' ? 'ARCHIVIO IN ATTESA' : 'ARCHIVIO CIFRATO'}</span><button className="icon-btn settings-gear-btn" onClick={() => {setError('');setMessage('');setSettingsHubOpen(true);}} title="Impostazioni" aria-label="Apri impostazioni"><Settings size={19}/></button><button className="icon-btn" onClick={handleLogout} title="Esci" aria-label="Esci"><LogOut size={18}/></button></div>
       </header>
-      <section className="welcome">
-        <div><div className="eyebrow"><span className="pulse-dot"/> IL TUO SPAZIO PERSONALE</div><h1>La tua <span>cassaforte.</span></h1><p>I nuovi video vengono cifrati sul dispositivo prima del caricamento.</p></div>
-        <div style={{display:'flex',gap:10,flexWrap:'wrap',justifyContent:'flex-end'}}>
-          
-          <button className="upload-btn" type="button" onClick={openUploadDestination}><UploadCloud size={18}/> Carica video</button>
-          <input ref={uploadInputRef} type="file" accept="video/*" multiple hidden onChange={handleUpload}/>
-        </div>
-      </section>
-      <section className="stats">
-        <div className="stat-card"><div className="stat-icon"><Film size={18}/></div><div><strong>{videos.length}</strong><span>Video archiviati</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{formatSize(storageQuota?.usedBytes ?? totalBytes)} / {formatSize(storageQuota?.personalLimitBytes ?? 2_000_000_000)}</strong><span>Spazio Backblaze utilizzato</span></div></div>
-        <div className="stat-card"><div className="stat-icon"><HardDrive size={18}/></div><div><strong>{googleDriveQuota?.limitBytes == null && googleDriveQuota ? 'Senza limite' : googleDriveQuota?.availableBytes != null ? formatSize(googleDriveQuota.availableBytes) : googleAccounts.length ? 'Aggiorna Google' : 'Non collegato'}</strong><span>Spazio disponibile su Google Drive</span></div></div>
-      </section>
-
+      <nav className="vault-navigation" aria-label="Sezioni di Vault">
+        <button type="button" className={'vault-nav-tab ' + (activeSection === 'gallery' ? 'active' : '')} onClick={() => setActiveSection('gallery')} aria-current={activeSection === 'gallery' ? 'page' : undefined}>
+          <Film size={17}/> Galleria <span>{videos.length}</span>
+        </button>
+        <button type="button" className={'vault-nav-tab ' + (activeSection === 'overview' ? 'active' : '')} onClick={() => setActiveSection('overview')} aria-current={activeSection === 'overview' ? 'page' : undefined}>
+          <Activity size={17}/> Panoramica
+        </button>
+      </nav>
+      {activeSection === 'gallery' ? (
+        <section className="welcome">
+          <div><div className="eyebrow"><span className="pulse-dot"/> IL TUO SPAZIO PERSONALE</div><h1>La tua <span>galleria.</span></h1><p>I tuoi video privati, ordinati in un unico posto. I nuovi caricamenti vengono cifrati sul dispositivo.</p></div>
+          <div className="welcome-actions">
+            <button className="upload-btn" type="button" onClick={openUploadDestination}><UploadCloud size={18}/> Carica video</button>
+          </div>
+        </section>
+      ) : (
+        <section className="overview-intro">
+          <div>
+            <div className="eyebrow"><span className="pulse-dot"/> STATO DELLA CASSAFORTE</div>
+            <h1>La tua <span>panoramica.</span></h1>
+            <p>Spazio occupato, account collegati e controlli di protezione.</p>
+            <div className="overview-updated">{dataUpdatedAt ? 'Dati aggiornati il ' + new Date(dataUpdatedAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' }) : 'Dati non ancora aggiornati'}</div>
+          </div>
+          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading}>
+            {loadingVideos || securityLoading ? <LoaderCircle className="spin" size={16}/> : <RefreshCw size={16}/>}
+            Aggiorna dati
+          </button>
+        </section>
+      )}
+      <input ref={uploadInputRef} type="file" accept="video/*" multiple hidden onChange={handleUpload}/>
       {uploading && <div className="upload-progress"><LoaderCircle className="spin" size={17}/><div><b>Caricamento in corso</b><span>{progressName}</span></div></div>}
       {uploadDestinationOpen && <div className="modal-backdrop" onClick={() => setUploadDestinationOpen(false)}><div className="share-modal upload-destination-modal" onClick={event => event.stopPropagation()}><button className="modal-close" type="button" onClick={() => setUploadDestinationOpen(false)} aria-label="Chiudi"><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">NUOVO CARICAMENTO</div><h2>Dove vuoi salvarlo?</h2><p>Scegli la destinazione per questo caricamento. Il video verrà cifrato sul dispositivo prima del trasferimento.</p><div className="upload-destination-options"><button className="upload-destination-option" type="button" onClick={() => chooseUploadDestination('backblaze')}><span className="upload-destination-icon"><ShieldCheck size={20}/></span><span><b>Backblaze B2</b><small>Spazio personale Vault</small></span><ArrowUpRight size={17}/></button>{googleAccounts.map(account => <button className="upload-destination-option" type="button" key={account.id} disabled={account.status === 'error'} onClick={() => chooseUploadDestination('google:' + account.id)}><span className="upload-destination-icon"><HardDrive size={20}/></span><span><b>Google Drive</b><small>{account.status === 'error' ? 'Account da ricollegare' : account.email}</small></span>{account.status === 'error' ? <AlertCircle size={17}/> : <ArrowUpRight size={17}/>}</button>)}</div>{googleAccounts.length === 0 && <button className="secondary-share-btn" type="button" onClick={() => {setUploadDestinationOpen(false);setStorageOpen(true);}}><HardDrive size={16}/> Collega Google Drive</button>}</div></div>}
       {error && <div className="notice error dashboard-notice"><AlertCircle size={16}/>{error}<button onClick={() => setError('')}><X size={15}/></button></div>}
+      {activeSection === 'overview' && (
+        <section className="vault-overview" aria-label="Panoramica dello spazio e della sicurezza">
+          <div className="overview-storage-grid">
+            <article className="overview-card">
+              <div className="overview-provider-head">
+                <div className="overview-provider-icon"><HardDrive size={19}/></div>
+                <div className="overview-provider-title"><span>ARCHIVIO PRINCIPALE</span><h2>Backblaze B2</h2></div>
+                <span className={'overview-provider-state ' + (storageQuota ? 'is-ready' : 'is-pending')}>{storageQuota ? 'Connesso' : 'Dati non disponibili'}</span>
+              </div>
+              {storageQuota ? (
+                <>
+                  <div className="overview-usage-number"><strong>{formatSize(backblazeUsedBytes)}</strong><span>di {formatSize(backblazeLimitBytes)} utilizzati</span></div>
+                  <UsageBar
+                    totalBytes={backblazeLimitBytes}
+                    label={'Backblaze: ' + formatSize(backblazeUsedBytes) + ' usati su ' + formatSize(backblazeLimitBytes)}
+                    segments={[
+                      { label: 'Video Vault', bytes: backblazeVideoSegment, className: 'usage-vault' },
+                      { label: 'Altri dati Vault', bytes: backblazeOtherSegment, className: 'usage-other' },
+                    ]}
+                  />
+                  <div className="overview-legend">
+                    <div><span className="legend-dot usage-vault"/><span>Video archiviati</span><b>{formatSize(backblazeVideoSegment)}</b></div>
+                    <div><span className="legend-dot usage-other"/><span>Altri dati Vault, inclusi i link temporanei</span><b>{formatSize(backblazeOtherSegment)}</b></div>
+                  </div>
+                  <div className="overview-free-space"><span>Spazio disponibile</span><strong>{formatSize(Math.max(0, backblazeLimitBytes - backblazeUsedBytes))}</strong></div>
+                  <p className="overview-footnote">Il limite di 2 GB è il limite personale applicato da Vault. Il conteggio include anche le copie temporanee dei link.</p>
+                </>
+              ) : (
+                <div className="overview-unavailable"><AlertCircle size={17}/><span>Non riesco a leggere la quota Backblaze in questo momento. Aggiorna i dati per riprovare.</span></div>
+              )}
+            </article>
+
+            <article className="overview-card">
+              <div className="overview-provider-head">
+                <div className="overview-provider-icon google"><HardDrive size={19}/></div>
+                <div className="overview-provider-title"><span>ARCHIVIO AGGIUNTIVO</span><h2>Google Drive</h2></div>
+                <span className={'overview-provider-state ' + (googleAccounts.length ? 'is-ready' : 'is-pending')}>{googleAccounts.length ? 'Collegato' : 'Non collegato'}</span>
+              </div>
+              {googleAccounts.length && googleDriveQuota ? (
+                <>
+                  <div className="overview-account-email">{googleAccounts[0].email}</div>
+                  <div className="overview-usage-number"><strong>{formatSize(driveTotalUsedBytes)}</strong><span>{driveLimitBytes == null ? 'utilizzati · quota totale non comunicata' : 'di ' + formatSize(driveLimitBytes) + ' utilizzati'}</span></div>
+                  {driveLimitBytes != null ? (
+                    <UsageBar
+                      totalBytes={driveLimitBytes}
+                      label={'Account Google: ' + formatSize(driveTotalUsedBytes) + ' utilizzati su ' + formatSize(driveLimitBytes)}
+                      segments={[
+                        { label: 'Video Vault', bytes: driveVideoSegment, className: 'usage-vault' },
+                        ...(hasDriveBreakdown ? [{ label: 'Altri file Drive', bytes: driveOtherFilesSegment, className: 'usage-other' }] : []),
+                        { label: hasDriveBreakdown ? 'Altri dati Google' : 'Altri dati account Google', bytes: otherGoogleSegment, className: 'usage-google' },
+                      ]}
+                    />
+                  ) : (
+                    <div className="overview-no-quota">Google non comunica il limite complessivo: la percentuale di spazio occupato non è calcolabile.</div>
+                  )}
+                  <div className="overview-legend">
+                    <div><span className="legend-dot usage-vault"/><span>Video salvati da Vault</span><b>{formatSize(driveVideoSegment)}</b></div>
+                    {hasDriveBreakdown && <div><span className="legend-dot usage-other"/><span>Altri file personali su Drive</span><b>{formatSize(driveOtherFilesSegment)}</b></div>}
+                    <div><span className="legend-dot usage-google"/><span>{hasDriveBreakdown ? 'Altri dati Google (es. Gmail e Foto)' : 'Altri dati dell’account Google'}</span><b>{formatSize(otherGoogleSegment)}</b></div>
+                  </div>
+                  {driveLimitBytes != null && <div className="overview-free-space"><span>Spazio disponibile nell’account</span><strong>{formatSize(Math.max(0, driveLimitBytes - driveTotalUsedBytes))}</strong></div>}
+                  <p className="overview-footnote">La quota totale Google può essere condivisa tra Drive, Gmail e Google Foto. La suddivisione dei file Drive viene mostrata solo quando Google restituisce il relativo dato.</p>
+                </>
+              ) : googleAccounts.length ? (
+                <div className="overview-unavailable"><AlertCircle size={17}/><span>{googleAccounts[0]?.quotaError || googleDriveError || 'I dati di Google Drive non sono al momento disponibili.'}</span></div>
+              ) : (
+                <div className="overview-connect-empty">
+                  <p>Collega un solo account Google per vedere quanto spazio occupano i video Vault e quanto resta agli altri tuoi file.</p>
+                  <button className="overview-refresh-btn" type="button" onClick={() => { setError(''); setStorageOpen(true); }}><HardDrive size={16}/> Gestisci collegamento</button>
+                </div>
+              )}
+              {googleAccounts.length > 1 && <p className="overview-warning-note">Sono presenti più account collegati da una configurazione precedente. Per mantenere l’archivio semplice, conserva un solo account e scollega gli altri dalle impostazioni.</p>}
+              {googleDriveError && <p className="overview-warning-note">{googleDriveError}</p>}
+            </article>
+          </div>
+
+          <article className="overview-card overview-security-card">
+            <div className="overview-security-head">
+              <div>
+                <span className="overview-eyebrow">CONTROLLO LOCALE DEI FILE</span>
+                <h2>Stato della sicurezza</h2>
+              </div>
+              <span className={'security-level security-level-' + securityState}>
+                {securityState === 'good' ? 'BUONA' : securityState === 'weak' ? 'DEBOLE' : securityState === 'check' ? 'DA VERIFICARE' : 'NON DISPONIBILE'}
+              </span>
+            </div>
+            <div className={'security-assessment security-assessment-' + securityState}>
+              <div className="security-assessment-icon">{securityState === 'weak' ? <ShieldAlert size={22}/> : securityState === 'unknown' ? <AlertCircle size={22}/> : <ShieldCheck size={22}/>}</div>
+              <div><strong>{securitySummary}</strong><p>{securityState === 'good'
+                ? 'La libreria caricata usa file .vlt cifrati con AES-256-GCM e nomi casuali nel cloud. È un controllo applicativo, non una certificazione o un audit indipendente.'
+                : securityState === 'unknown'
+                  ? 'Accedi e sblocca Vault per caricare i dati dell’archivio prima di effettuare la valutazione.'
+                  : 'La valutazione non è massima: consulta i motivi elencati e correggi gli elementi che non risultano protetti.'}</p></div>
+            </div>
+            <div className="security-metrics-grid">
+              <div><span>Video cifrati</span><strong>{videos.filter(item => item.encrypted).length} / {videos.length}</strong><small>Formato Vault .vlt</small></div>
+              <div><span>Nomi casuali nel cloud</span><strong>{videos.filter(item => isOpaqueVaultName(item.name)).length} / {videos.length}</strong><small>Identificativi non descrittivi</small></div>
+              <div><span>Titoli cifrati disponibili</span><strong>{videos.filter(item => item.encryptedMetadata).length} / {videos.length}</strong><small>Metadati leggibili da Vault</small></div>
+              <div><span>Link temporanei attivi</span><strong>{activeLinkCount}</strong><small>Condivisioni ancora valide</small></div>
+            </div>
+            {securityReasons.length > 0 && (
+              <div className="security-reasons">
+                <strong>Elementi da controllare</strong>
+                <ul>{securityReasons.map(reason => <li key={reason}>{reason}</li>)}</ul>
+              </div>
+            )}
+            {activeLinkCount > 0 && <p className="overview-footnote">Sono presenti {activeLinkCount} link temporanei attivi. Chi possiede un link valido può accedere al video condiviso fino alla scadenza o alla revoca.</p>}
+            <p className="overview-footnote">Vault verifica i file e i metadati caricati nella sessione corrente. Non può rilevare da solo screenshot, copie già scaricate da destinatari o modifiche avvenute fuori dall’app.</p>
+          </article>
+        </section>
+      )}
+      {activeSection === 'gallery' && (
       <section className="library">
         <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{videos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div></div></div>
         {loadingVideos ? <div className="empty-state"><LoaderCircle className="spin" size={24}/><p>Sto aprendo la cassaforte…</p></div> : visibleVideos.length === 0 ? (
@@ -1582,6 +1774,7 @@ function App() {
           ))}</div>
         )}
       </section>
+      )}
       <footer className="dash-footer"><span><ShieldCheck size={14}/> I video sono cifrati sul dispositivo prima del salvataggio nella destinazione scelta.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
       {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
       {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
@@ -1605,6 +1798,7 @@ function App() {
             {googleAccounts.map(account => <option key={account.id} value={'google:' + account.id}>Google Drive · {account.email}</option>)}
           </select>
         </div>
+        {googleAccounts.length > 1 && <div className="storage-error"><AlertCircle size={15}/><span>Vault ha rilevato più account Google già collegati. Non verranno aggiunti altri account: scegli quello che vuoi mantenere e scollega gli altri uno alla volta. I video resteranno nei rispettivi Drive.</span></div>}
         <div className="storage-account-list">
           {googleAccounts.length === 0
             ? <p className="storage-muted">Nessun account Google collegato. Puoi collegarne uno per usare il suo spazio Drive.</p>
