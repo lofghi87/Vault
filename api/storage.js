@@ -319,6 +319,18 @@ export default async function handler(req, res) {
       });
     }
 
+    if (action === 'integrity') {
+      const key = safeKey(body.path, userId);
+      if (key.includes('/_shares/')) return send(res, 400, { error: 'I file condivisi temporanei non possono essere verificati come video originali.' });
+      const target = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+      if (!target.Body) return send(res, 404, { error: 'Video non presente su Backblaze.' });
+      const result = await sha256Stream(target.Body);
+      if (!Number.isSafeInteger(result.size) || result.size <= 0) {
+        return send(res, 422, { error: 'Il file è vuoto o la lettura non è valida.' });
+      }
+      return send(res, 200, { data: result });
+    }
+
     if (action === 'quota') {
       const usage = await getBucketUsage(userId);
       return send(res, 200, { data: {
