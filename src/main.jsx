@@ -1070,6 +1070,10 @@ function App() {
 
 
   async function connectGoogleDrive() {
+    if (integrityChecking) {
+      setMessage('Attendi il termine del controllo di integrità prima di collegare Google Drive.');
+      return;
+    }
     if (!session?.user?.id || googleConnectBusy) return;
     setGoogleConnectBusy(true);
     setGoogleDriveError('');
@@ -1109,11 +1113,16 @@ function App() {
   }
 
   function openUploadDestination() {
+    if (integrityChecking || trashActionId) return;
     setError('');
     setUploadDestinationOpen(true);
   }
 
   function chooseUploadDestination(destination) {
+    if (integrityChecking || trashActionId) {
+      setError('Attendi il termine dell’operazione in corso.');
+      return;
+    }
     if (destination.startsWith('google:')) {
       const accountId = destination.slice('google:'.length);
       const account = googleAccounts.find(row => row.id === accountId);
@@ -1593,7 +1602,7 @@ function App() {
   }
 
   async function runIntegrityCheck() {
-    if (!session?.user?.id || !vaultKey || integrityChecking || trashActionId || renameBusy || !videos.length || uploading || rotationBusy || metadataMigrationBusy) return;
+    if (!session?.user?.id || !vaultKey || integrityChecking || trashActionId || renameBusy || openingVideoId || shareBusy || !videos.length || uploading || rotationBusy || metadataMigrationBusy) return;
     if (automaticIntegrityTimerRef.current) {
       window.clearTimeout(automaticIntegrityTimerRef.current);
       automaticIntegrityTimerRef.current = null;
@@ -1844,7 +1853,7 @@ function App() {
   useEffect(() => {
     if (!session?.user?.id || !vaultKey || loadedVaultKey !== vaultKey || incomingShare || !dataUpdatedAt || loadingVideos || !videos.length ||
         uploading || rotationBusy || metadataMigrationBusy || integrityChecking ||
-        trashActionId || renameBusy || automaticIntegrityStartedRef.current) return;
+        trashActionId || renameBusy || openingVideoId || shareBusy || automaticIntegrityStartedRef.current) return;
 
     const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
     const now = Date.now();
@@ -1918,7 +1927,7 @@ function App() {
       if (started) setIntegrityChecking(false);
       setIntegrityProgress('');
     };
-  }, [session?.user?.id, vaultKey, loadingVideos, dataUpdatedAt, loadedVaultKey, incomingShare]);
+  }, [session?.user?.id, vaultKey, loadingVideos, dataUpdatedAt, loadedVaultKey, incomingShare, openingVideoId, shareBusy, uploading, rotationBusy, metadataMigrationBusy, integrityChecking, trashActionId, renameBusy]);
 
   if (incomingShare) return (
     <main className="auth-page incoming-share-page">
@@ -2007,7 +2016,7 @@ function App() {
             <p>Spazio occupato, account collegati e controlli di protezione.</p>
             <div className="overview-updated">{dataUpdatedAt ? 'Dati aggiornati il ' + new Date(dataUpdatedAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' }) : 'Dati non ancora aggiornati'}</div>
           </div>
-          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading || integrityChecking}>
+          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading || integrityChecking || openingVideoId !== null || shareBusy}>
             {loadingVideos || securityLoading ? <LoaderCircle className="spin" size={16}/> : <RefreshCw size={16}/>}
             Aggiorna dati
           </button>
@@ -2135,7 +2144,7 @@ function App() {
                   className="overview-refresh-btn"
                   type="button"
                   onClick={runIntegrityCheck}
-                  disabled={integrityChecking || trashActionId !== '' || renameBusy || loadingVideos || uploading || rotationBusy || metadataMigrationBusy || !videos.length}
+                  disabled={integrityChecking || trashActionId !== '' || renameBusy || openingVideoId !== null || shareBusy || loadingVideos || uploading || rotationBusy || metadataMigrationBusy || !videos.length}
                 >
                   {integrityChecking ? <LoaderCircle className="spin" size={16}/> : <ShieldCheck size={16}/>}
                   {integrityChecking ? 'Verifica in corso…' : 'Verifica integrità'}
