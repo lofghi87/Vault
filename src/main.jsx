@@ -471,6 +471,7 @@ function App() {
   const [notificationsEnabled, setNotificationsEnabled] = useState(() => typeof window !== 'undefined' && 'Notification' in window && Notification.permission === 'granted');
   const [nowTick, setNowTick] = useState(() => Date.now());
   const notifiedShareIds = useRef(new Set());
+  const automaticIntegrityStartedRef = useRef(false);
   const videoElementRef = useRef(null);
   const uploadInputRef = useRef(null);
   const uploadDestinationRef = useRef('backblaze');
@@ -1239,6 +1240,60 @@ function App() {
     };
   }
 
+  async function verifyVideoIntegrity(item) {
+    const providerResult = item.provider === 'google'
+      ? await googleRequest(session, { action: 'integrity', accountId: item.accountId, fileId: item.fileId })
+      : await b2Request(session, { action: 'integrity', path: item.path });
+    const actual = providerResult.data || {};
+    if (!/^[0-9a-f]{64}$/i.test(actual.sha256 || '') || !Number.isSafeInteger(Number(actual.size)) || Number(actual.size) <= 0) {
+      throw new Error('Il provider non ha restituito un checksum SHA-256 e una dimensione validi.');
+    }
+
+    const metadata = await readMetadataForVideo(item);
+    const previousHash = /^[0-9a-f]{64}$/i.test(metadata.integritySha256 || '')
+      ? metadata.integritySha256.toLowerCase()
+      : '';
+    const previousSize = Number(metadata.integritySize || 0);
+    const actualHash = actual.sha256.toLowerCase();
+    const actualSize = Number(actual.size);
+    const checkedAt = new Date().toISOString();
+    const nextMetadata = { ...metadata, integrityLastCheckedAt: checkedAt };
+    let status;
+    let detail;
+
+    if (!previousHash) {
+      status = 'baseline';
+      detail = 'Prima impronta SHA-256 salvata. I prossimi controlli potranno confrontare il file con questo riferimento.';
+      nextMetadata.integritySha256 = actualHash;
+      nextMetadata.integritySize = actualSize;
+    } else if (previousHash !== actualHash || (previousSize > 0 && previousSize !== actualSize)) {
+      status = 'mismatch';
+      detail = 'Il contenuto attuale non coincide con l’impronta salvata in precedenza. Nessuna copia è stata sostituita o eliminata.';
+    } else {
+      status = 'verified';
+      detail = 'SHA-256 e dimensione coincidono con l’impronta salvata.';
+    }
+
+    nextMetadata.integrityLastStatus = status;
+    await saveEncryptedVideoMetadata(
+      session.user.id,
+      metadataStoragePath(session.user.id, item.path),
+      nextMetadata,
+      vaultKey
+    );
+    return {
+      result: {
+        id: item.id,
+        name: item.displayName || getDisplayName(item.name),
+        provider: item.providerLabel,
+        status,
+        detail,
+        checkedAt,
+      },
+      metadata: nextMetadata,
+    };
+  }
+
   function beginRename(item) {
     setRenameItem(item);
     setRenameValue((item.displayName || getDisplayName(item.name)).replace(/\.[^.]+$/, ''));
@@ -1534,60 +1589,23 @@ function App() {
     setIntegrityResults([]);
     setError('');
     const results = [];
+    automaticIntegrityStartedRef.current = true;
     try {
       for (let index = 0; index < targets.length; index++) {
         const item = targets[index];
         const displayName = item.displayName || getDisplayName(item.name);
         setIntegrityProgress('Verifica ' + (index + 1) + ' di ' + targets.length + ': ' + displayName);
         try {
-          const providerResult = item.provider === 'google'
-            ? await googleRequest(session, { action: 'integrity', accountId: item.accountId, fileId: item.fileId })
-            : await b2Request(session, { action: 'integrity', path: item.path });
-          const actual = providerResult.data || {};
-          if (!/^[0-9a-f]{64}$/i.test(actual.sha256 || '') || !Number.isSafeInteger(Number(actual.size)) || Number(actual.size) <= 0) {
-            throw new Error('Il provider non ha restituito un checksum SHA-256 e una dimensione validi.');
-          }
-
-          const metadata = await readMetadataForVideo(item);
-          const previousHash = /^[0-9a-f]{64}$/i.test(metadata.integritySha256 || '')
-            ? metadata.integritySha256.toLowerCase()
-            : '';
-          const previousSize = Number(metadata.integritySize || 0);
-          const actualHash = actual.sha256.toLowerCase();
-          const actualSize = Number(actual.size);
-          let status;
-          let detail;
-          const checkedAt = new Date().toISOString();
-          const nextMetadata = { ...metadata, integrityLastCheckedAt: checkedAt };
-          if (!previousHash) {
-            status = 'baseline';
-            detail = 'Prima impronta SHA-256 salvata. I prossimi controlli potranno confrontare il file con questo riferimento.';
-            nextMetadata.integritySha256 = actualHash;
-            nextMetadata.integritySize = actualSize;
-          } else if (previousHash !== actualHash || (previousSize > 0 && previousSize !== actualSize)) {
-            status = 'mismatch';
-            detail = 'Il contenuto attuale non coincide con l’impronta salvata in precedenza. Nessuna copia è stata sostituita o eliminata.';
-          } else {
-            status = 'verified';
-            detail = 'SHA-256 e dimensione coincidono con l’impronta salvata.';
-          }
-          nextMetadata.integrityLastStatus = status;
-          await saveEncryptedVideoMetadata(
-            session.user.id,
-            metadataStoragePath(session.user.id, item.path),
-            nextMetadata,
-            vaultKey
-          );
-          const resultRow = { id: item.id, name: displayName, provider: item.providerLabel, status, detail, checkedAt };
-          results.push(resultRow);
+          const checked = await verifyVideoIntegrity(item);
+          results.push(checked.result);
           setVideos(current => current.map(video => video.id === item.id ? {
             ...video,
-            vaultMetadata: nextMetadata,
+            vaultMetadata: checked.metadata,
             encryptedMetadata: true,
-            integritySha256: nextMetadata.integritySha256 || '',
-            integritySize: Number(nextMetadata.integritySize || 0),
-            integrityLastStatus: status,
-            integrityLastCheckedAt: checkedAt,
+            integritySha256: checked.metadata.integritySha256 || '',
+            integritySize: Number(checked.metadata.integritySize || 0),
+            integrityLastStatus: checked.metadata.integrityLastStatus || 'pending',
+            integrityLastCheckedAt: checked.metadata.integrityLastCheckedAt || null,
           } : video));
         } catch (itemError) {
           results.push({
@@ -1797,6 +1815,80 @@ function App() {
       ? (bytes / 1_000_000).toFixed(1) + ' MB'
       : (bytes / 1_000_000_000).toFixed(2) + ' GB';
   const formatDate = value => value ? new Date(value).toLocaleDateString('it-IT', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
+
+  useEffect(() => {
+    automaticIntegrityStartedRef.current = false;
+  }, [session?.user?.id, vaultKey]);
+
+  useEffect(() => {
+    if (!session?.user?.id || !vaultKey || loadingVideos || !videos.length ||
+        uploading || rotationBusy || metadataMigrationBusy || integrityChecking ||
+        trashActionId || renameBusy || automaticIntegrityStartedRef.current) return;
+
+    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const dueItems = videos
+      .filter(item => {
+        const lastChecked = item.integrityLastCheckedAt ? new Date(item.integrityLastCheckedAt).getTime() : 0;
+        return !Number.isFinite(lastChecked) || lastChecked === 0 || now - lastChecked >= maxAgeMs;
+      })
+      .sort((a, b) => {
+        const aDate = a.integrityLastCheckedAt ? new Date(a.integrityLastCheckedAt).getTime() : 0;
+        const bDate = b.integrityLastCheckedAt ? new Date(b.integrityLastCheckedAt).getTime() : 0;
+        return aDate - bDate;
+      });
+    if (!dueItems.length) return;
+
+    const candidate = dueItems[0];
+    automaticIntegrityStartedRef.current = true;
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      if (cancelled) return;
+      setIntegrityChecking(true);
+      setIntegrityProgress('Controllo automatico: ' + (candidate.displayName || getDisplayName(candidate.name)));
+      try {
+        const checked = await verifyVideoIntegrity(candidate);
+        if (cancelled) return;
+        setVideos(current => current.map(video => video.id === candidate.id ? {
+          ...video,
+          vaultMetadata: checked.metadata,
+          encryptedMetadata: true,
+          integritySha256: checked.metadata.integritySha256 || '',
+          integritySize: Number(checked.metadata.integritySize || 0),
+          integrityLastStatus: checked.metadata.integrityLastStatus || 'pending',
+          integrityLastCheckedAt: checked.metadata.integrityLastCheckedAt || null,
+        } : video));
+        setIntegrityResults([checked.result]);
+        setIntegrityRunAt(new Date().toISOString());
+        setMessage(checked.result.status === 'mismatch'
+          ? 'Controllo automatico: rilevata un’anomalia in "' + checked.result.name + '". Consulta la Panoramica.'
+          : checked.result.status === 'baseline'
+            ? 'Controllo automatico: salvata la prima impronta di "' + checked.result.name + '".'
+            : 'Controllo automatico completato per "' + checked.result.name + '".');
+      } catch (checkError) {
+        if (!cancelled) {
+          setIntegrityResults([{
+            id: candidate.id,
+            name: candidate.displayName || getDisplayName(candidate.name),
+            provider: candidate.providerLabel,
+            status: 'error',
+            detail: checkError.message || 'Errore durante il controllo automatico.',
+            checkedAt: new Date().toISOString(),
+          }]);
+          setError('Controllo automatico non completato: ' + (checkError.message || 'errore sconosciuto') + '. Puoi riprovare da Panoramica.');
+        }
+      } finally {
+        if (!cancelled) {
+          setIntegrityChecking(false);
+          setIntegrityProgress('');
+        }
+      }
+    }, 1500);
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [session?.user?.id, vaultKey, loadingVideos, videos, uploading, rotationBusy, metadataMigrationBusy, integrityChecking, trashActionId, renameBusy]);
 
   if (incomingShare) return (
     <main className="auth-page incoming-share-page">
