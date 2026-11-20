@@ -1227,9 +1227,14 @@ function App() {
 
     setUploading(true);
     setError('');
+    setMessage('');
     const uploadedDriveItems = [];
-    for (const file of selected) {
-      setProgressName(file.name);
+    const failures = [];
+    let completed = 0;
+    let nextIndex = 0;
+    const concurrency = Math.min(2, selected.length);
+
+    async function uploadOne(file, index) {
       const storedName = crypto.randomUUID() + '.vlt';
       const path = session.user.id + '/Vault/' + storedName;
       try {
@@ -1237,7 +1242,10 @@ function App() {
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
           const drivePath = 'google:' + googleAccountId + ':' + saved.id;
-          await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), { name: file.name, mime: file.type || getOriginalVideoMime(file.name) }, vaultKey);
+          await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), {
+            name: file.name,
+            mime: file.type || getOriginalVideoMime(file.name),
+          }, vaultKey);
           uploadedDriveItems.push({
             id: 'google-' + googleAccountId + '-' + saved.id,
             fileId: saved.id,
@@ -1256,23 +1264,51 @@ function App() {
           await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
         } else {
           await b2Upload(session, path, encrypted);
-          await saveEncryptedVideoMetadata(session.user.id, path, { name: file.name, mime: file.type || 'video/mp4' }, vaultKey);
+          await saveEncryptedVideoMetadata(session.user.id, path, {
+            name: file.name,
+            mime: file.type || getOriginalVideoMime(file.name),
+          }, vaultKey);
           await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
         }
       } catch (uploadError) {
-        setError('Errore durante la cifratura o il caricamento di ' + file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
-        break;
+        failures.push(file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
+      } finally {
+        completed++;
+        setProgressName(completed + ' di ' + selected.length + ' completati · ' + file.name);
       }
     }
-    setUploading(false);
-    setProgressName('');
-    await loadVideos();
-    if (uploadedDriveItems.length) {
-      setVideos(current => {
-        const byId = new Map(current.map(item => [item.id, item]));
-        uploadedDriveItems.forEach(item => byId.set(item.id, item));
-        return Array.from(byId.values());
-      });
+
+    async function worker() {
+      while (true) {
+        const index = nextIndex++;
+        if (index >= selected.length) return;
+        const file = selected[index];
+        setProgressName('Preparazione ' + (index + 1) + ' di ' + selected.length + ' · ' + file.name);
+        await uploadOne(file, index);
+      }
+    }
+
+    try {
+      await Promise.all(Array.from({ length: concurrency }, () => worker()));
+    } finally {
+      setUploading(false);
+      setProgressName('');
+      await loadVideos();
+      if (uploadedDriveItems.length) {
+        setVideos(current => {
+          const byId = new Map(current.map(item => [item.id, item]));
+          uploadedDriveItems.forEach(item => byId.set(item.id, item));
+          return Array.from(byId.values());
+        });
+      }
+    }
+
+    if (failures.length) {
+      setError('Caricamento terminato: ' + (selected.length - failures.length) + ' di ' + selected.length + ' video caricati. Errori: ' + failures.slice(0, 3).join(' · '));
+    } else {
+      setMessage(selected.length === 1
+        ? 'Video caricato e cifrato correttamente.'
+        : 'Tutti e ' + selected.length + ' video sono stati caricati e cifrati correttamente.');
     }
   }
 
