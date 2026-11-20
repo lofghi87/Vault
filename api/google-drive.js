@@ -1,4 +1,15 @@
 import { Readable } from 'node:stream';
+import { createHash } from 'node:crypto';
+
+async function hashReadableStream(stream) {
+  const hash = createHash('sha256');
+  let size = 0;
+  for await (const chunk of Readable.fromWeb(stream)) {
+    hash.update(chunk);
+    size += chunk.length;
+  }
+  return { sha256: hash.digest('hex'), size };
+}
 import {
   googleConfigReady, requireUser, getGoogleAccount, getGoogleAccessToken,
   decryptRefreshToken, googleApi, startGoogleOAuth, listGoogleFiles,
@@ -92,6 +103,37 @@ export default async function handler(req, res) {
         driveTrashBytes: result.storageQuota.usageInDriveTrash == null ? null : Number(result.storageQuota.usageInDriveTrash),
         availableBytes: limitBytes == null ? null : Math.max(0, limitBytes - usedBytes),
       } });
+    }
+
+    if (action === 'integrity') {
+      const account = await getGoogleAccount(admin, user.id, req.body.accountId);
+      const fileId = String(req.body.fileId || '');
+      if (!fileId || fileId.includes('/')) return send(res, 400, { error: 'File Google Drive non valido.' });
+      const accessToken = await getGoogleAccessToken(admin, account);
+      const metadataResponse = await googleApi(
+        accessToken,
+        '/drive/v3/files/' + encodeURIComponent(fileId) + '?fields=id,name,size,parents,sha256Checksum'
+      );
+      const file = await metadataResponse.json().catch(() => ({}));
+      if (!metadataResponse.ok || !file.id || !(file.parents || []).includes(account.folder_id) || !file.name?.endsWith('.vlt')) {
+        return send(res, 404, { error: 'Video non trovato nella cartella Vault di questo account.' });
+      }
+      const providerSize = Number(file.size || 0);
+      if (file.sha256Checksum && /^[0-9a-f]{64}$/i.test(file.sha256Checksum)) {
+        return send(res, 200, { data: { sha256: file.sha256Checksum.toLowerCase(), size: providerSize, source: 'google' } });
+      }
+      const contentResponse = await googleApi(
+        accessToken,
+        '/drive/v3/files/' + encodeURIComponent(fileId) + '?alt=media'
+      );
+      if (!contentResponse.ok || !contentResponse.body) {
+        return send(res, contentResponse.status || 502, { error: 'Google Drive non ha consentito la lettura completa del video per il controllo.' });
+      }
+      const result = await hashReadableStream(contentResponse.body);
+      if (!result.size || (providerSize && result.size !== providerSize)) {
+        return send(res, 422, { error: 'La dimensione letta da Google Drive non coincide con i metadati del file.' });
+      }
+      return send(res, 200, { data: { ...result, source: 'stream' } });
     }
 
     if (action === 'list') {
