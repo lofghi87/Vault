@@ -1244,10 +1244,8 @@ function App() {
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
           const drivePath = 'google:' + googleAccountId + ':' + saved.id;
-          await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), {
-            name: file.name,
-            mime: file.type || getOriginalVideoMime(file.name),
-          }, vaultKey);
+          // Da questo momento il file è già stato confermato da Google Drive:
+          // non classificare come fallito l'upload se fallisce un'operazione secondaria.
           uploadedDriveItems.push({
             id: 'google-' + googleAccountId + '-' + saved.id,
             fileId: saved.id,
@@ -1255,14 +1253,23 @@ function App() {
             accountEmail: googleAccount.email,
             path: drivePath,
             name: saved.name || storedName,
-            displayName: getDisplayName(saved.name || storedName),
+            displayName: file.name || getDisplayName(saved.name || storedName),
             size: Number(saved.size || encrypted.size),
             created_at: saved.created_at || new Date().toISOString(),
-            mime: getOriginalVideoMime(storedName),
+            mime: file.type || getOriginalVideoMime(storedName),
             encrypted: true,
             provider: 'google',
             providerLabel: 'Google Drive · ' + googleAccount.email,
           });
+          try {
+            await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), {
+              name: file.name,
+              mime: file.type || getOriginalVideoMime(file.name),
+            }, vaultKey);
+          } catch (metadataError) {
+            console.warn('Video salvato su Google Drive, ma metadati non salvati:', metadataError);
+            failures.push(file.name + ': video salvato, ma dettagli non sincronizzati (' + (metadataError.message || 'errore metadati') + ')');
+          }
           await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Google Drive · ' + googleAccount.email);
         } else {
           await b2Upload(session, path, encrypted);
