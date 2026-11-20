@@ -773,7 +773,7 @@ function App() {
 
   async function protectExistingVideoNames() {
     if (!session?.user?.id || !vaultKey || metadataMigrationBusy || rotationBusy) return;
-    const candidates = videos.filter(item => item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\.vlt$/i.test(item.name || ''));
+    const candidates = videos.filter(item => !item.trashedAt && item.encrypted && !/^[0-9a-f]{8}-[0-9a-f-]{27,}\.vlt$/i.test(item.name || ''));
     if (!candidates.length) {
       setMetadataMigrationProgress('Non risultano nomi legacy da proteggere nella libreria caricata.');
       return;
@@ -805,7 +805,7 @@ function App() {
           }
           const newName = crypto.randomUUID() + '.vlt';
           if (item.provider === 'google') {
-            await saveEncryptedVideoMetadata(session.user.id, oldPath, { name: displayName, mime }, vaultKey);
+            await saveEncryptedVideoMetadata(session.user.id, oldPath, { ...(storedMetadata || {}), name: displayName, mime }, vaultKey);
             await googleRequest(session, { action: 'rename', accountId: item.accountId, fileId: item.fileId, name: newName });
           } else if (item.provider === 'backblaze') {
             const directory = item.path.slice(0, item.path.lastIndexOf('/') + 1);
@@ -814,7 +814,7 @@ function App() {
             try {
               const copied = await b2Download(session, newPath);
               await decryptVideo(copied, vaultKey, mime);
-              await saveEncryptedVideoMetadata(session.user.id, newPath, { name: displayName, mime }, vaultKey);
+              await saveEncryptedVideoMetadata(session.user.id, newPath, { ...(storedMetadata || {}), name: displayName, mime }, vaultKey);
               const confirmedCopy = await b2Download(session, newPath);
               await decryptVideo(confirmedCopy, vaultKey, mime);
             } catch (verificationError) {
@@ -932,6 +932,7 @@ function App() {
         if (metadata) {
           item.displayName = metadata.name;
           item.mime = metadata.mime;
+          item.vaultMetadata = metadata;
         }
       }
 
@@ -957,14 +958,30 @@ function App() {
           if (item.provider === 'google') {
             const saved = await googleUpload(session, item.accountId, newName, encrypted);
             const newMetadataPath = 'google:' + item.accountId + ':' + saved.id;
-            await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newMetadataPath), { name: item.displayName, mime: item.mime }, newKey);
+            await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newMetadataPath), {
+              ...(item.vaultMetadata || {}),
+              name: item.displayName,
+              mime: item.mime,
+              integritySha256: null,
+              integritySize: null,
+              integrityLastCheckedAt: null,
+              integrityLastStatus: 'pending',
+            }, newKey);
             stagedItems.push({ provider: 'google', accountId: item.accountId, fileId: saved.id, metadataPath: metadataStoragePath(session.user.id, newMetadataPath) });
             const savedCopy = await googleDownload(session, item.accountId, saved.id, saved.size);
             await decryptVideo(savedCopy, newKey, item.mime);
           } else {
             const newPath = session.user.id + '/Vault/' + newName;
             await b2Upload(session, newPath, encrypted);
-            await saveEncryptedVideoMetadata(session.user.id, newPath, { name: item.displayName, mime: item.mime }, newKey);
+            await saveEncryptedVideoMetadata(session.user.id, newPath, {
+              ...(item.vaultMetadata || {}),
+              name: item.displayName,
+              mime: item.mime,
+              integritySha256: null,
+              integritySize: null,
+              integrityLastCheckedAt: null,
+              integrityLastStatus: 'pending',
+            }, newKey);
             stagedItems.push({ provider: 'backblaze', path: newPath, metadataPath: newPath });
             const savedCopy = await b2Download(session, newPath);
             await decryptVideo(savedCopy, newKey, item.mime);
@@ -1200,6 +1217,28 @@ function App() {
     }
   }
 
+  async function readMetadataForVideo(item) {
+    const storagePath = metadataStoragePath(session.user.id, item.path);
+    if (item.vaultMetadata) return item.vaultMetadata;
+    const metadataMap = await loadEncryptedVideoMetadata(session.user.id, [storagePath], vaultKey);
+    const existing = metadataMap.get(storagePath);
+    if (existing) return existing;
+    const { data: storedRow, error: rowError } = await supabase
+      .from('vault_video_meta')
+      .select('storage_path')
+      .eq('user_id', session.user.id)
+      .eq('storage_path', storagePath)
+      .maybeSingle();
+    if (rowError) throw new Error('Non riesco a controllare i metadati del video: ' + rowError.message);
+    if (storedRow) {
+      throw new Error('I metadati cifrati esistono ma non sono leggibili con la chiave attuale. Per sicurezza non li sovrascrivo.');
+    }
+    return {
+      name: item.displayName || getDisplayName(item.name),
+      mime: item.mime || getOriginalVideoMime(item.name),
+    };
+  }
+
   function beginRename(item) {
     setRenameItem(item);
     setRenameValue((item.displayName || getDisplayName(item.name)).replace(/\.[^.]+$/, ''));
@@ -1218,6 +1257,14 @@ function App() {
     const newName = crypto.randomUUID() + '.vlt';
     const newPath = renameItem.provider === 'google' ? renameItem.path : session.user.id + '/Vault/' + newName;
     setRenameBusy(true); setError('');
+    let currentMetadata;
+    try {
+      currentMetadata = await readMetadataForVideo(renameItem);
+    } catch (metadataReadError) {
+      setRenameBusy(false);
+      setError(metadataReadError.message || 'Non riesco a leggere i metadati cifrati.');
+      return;
+    }
     try {
       if (renameItem.provider === 'google') {
         await googleRequest(session, { action: 'rename', accountId: renameItem.accountId, fileId: renameItem.fileId, name: newName });
@@ -1231,7 +1278,7 @@ function App() {
     }
     setRenameBusy(false);
     try {
-      await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newPath), { name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
+      await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, newPath), { ...currentMetadata, name: clean + extension, mime: renameItem.mime || 'video/mp4' }, vaultKey);
       if (renameItem.path !== newPath) {
         await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, renameItem.path));
       }
@@ -1364,30 +1411,207 @@ function App() {
   }
 
   async function deleteVideo(item) {
-    if (!window.confirm('Vuoi eliminare definitivamente questo video? Verranno rimossi anche i link temporanei ancora attivi associati al file.')) return;
-    const { data: linkedShares, error: sharesError } = await supabase.from('vault_shares').select('id,storage_path').eq('user_id', session.user.id).eq('original_path', item.path).is('revoked_at', null);
-    if (sharesError) { setError('Non riesco a verificare i link attivi: ' + sharesError.message); return; }
-    if (linkedShares?.length) {
-      try { await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path)); }
-      catch (shareDeleteError) { setError('Non riesco a revocare tutti i link collegati: ' + shareDeleteError.message); return; }
-      await supabase.from('vault_shares').update({ revoked_at: new Date().toISOString() }).in('id', linkedShares.map(row => row.id));
-    }
+    if (!item || item.trashedAt || trashActionId) return;
+    if (!window.confirm('Spostare "' + (item.displayName || 'questo video') + '" nel cestino? Il file resterà nello spazio cloud e continuerà a occupare quota. Potrai ripristinarlo oppure eliminarlo definitivamente dal cestino.')) return;
+    setTrashActionId(item.id);
+    setError('');
     try {
+      const metadata = await readMetadataForVideo(item);
+      const { data: linkedShares, error: sharesError } = await supabase
+        .from('vault_shares')
+        .select('id,storage_path')
+        .eq('user_id', session.user.id)
+        .eq('original_path', item.path)
+        .is('revoked_at', null);
+      if (sharesError) throw new Error('Non riesco a verificare i link attivi: ' + sharesError.message);
+      if (linkedShares?.length) {
+        await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path));
+        const { error: markSharesError } = await supabase
+          .from('vault_shares')
+          .update({ revoked_at: new Date().toISOString() })
+          .in('id', linkedShares.map(row => row.id));
+        if (markSharesError) throw new Error('Le copie dei link sono state rimosse, ma non riesco ad aggiornare il registro: ' + markSharesError.message);
+      }
+      const trashedAt = new Date().toISOString();
+      await saveEncryptedVideoMetadata(
+        session.user.id,
+        metadataStoragePath(session.user.id, item.path),
+        { ...metadata, trashedAt },
+        vaultKey
+      );
+      await logActivity(session.user.id, 'video_deleted', null, 'Video spostato nel cestino; file conservato nello spazio cloud.');
+      setMessage('Video spostato nel cestino. Il file è ancora conservato e può essere ripristinato.');
+      await Promise.all([loadVideos(), loadSecurityData()]);
+    } catch (trashError) {
+      setError('Non sono riuscito a spostare il video nel cestino: ' + (trashError.message || 'errore sconosciuto'));
+    } finally {
+      setTrashActionId('');
+    }
+  }
+
+  async function restoreVideo(item) {
+    if (!item?.trashedAt || trashActionId) return;
+    setTrashActionId(item.id);
+    setError('');
+    try {
+      const metadata = await readMetadataForVideo(item);
+      const { trashedAt, ...restoredMetadata } = metadata;
+      await saveEncryptedVideoMetadata(
+        session.user.id,
+        metadataStoragePath(session.user.id, item.path),
+        restoredMetadata,
+        vaultKey
+      );
+      setMessage('Video ripristinato nella galleria.');
+      await loadVideos();
+    } catch (restoreError) {
+      setError('Non sono riuscito a ripristinare il video: ' + (restoreError.message || 'errore sconosciuto'));
+    } finally {
+      setTrashActionId('');
+    }
+  }
+
+  async function permanentlyDeleteVideo(item) {
+    if (!item?.trashedAt || trashActionId) return;
+    if (!window.confirm('Eliminare definitivamente "' + (item.displayName || 'questo video') + '"? Il file verrà rimosso dal provider cloud e non potrà essere recuperato da Vault.')) return;
+    setTrashActionId(item.id);
+    setError('');
+    try {
+      const { data: linkedShares, error: sharesError } = await supabase
+        .from('vault_shares')
+        .select('id,storage_path')
+        .eq('user_id', session.user.id)
+        .eq('original_path', item.path)
+        .is('revoked_at', null);
+      if (sharesError) throw new Error('Non riesco a verificare i link collegati: ' + sharesError.message);
+      if (linkedShares?.length) {
+        await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path));
+        const { error: markSharesError } = await supabase
+          .from('vault_shares')
+          .update({ revoked_at: new Date().toISOString() })
+          .in('id', linkedShares.map(row => row.id));
+        if (markSharesError) throw new Error('Non riesco ad aggiornare il registro dei link: ' + markSharesError.message);
+      }
       if (item.provider === 'google') {
         await googleRequest(session, { action: 'delete', accountId: item.accountId, fileId: item.fileId });
       } else {
         await b2Delete(session, [item.path]);
       }
-    } catch (deleteError) { setError(deleteError.message); return; }
-    {
-      await supabase.from('vault_video_meta').delete().eq('user_id', session.user.id).eq('storage_path', metadataStoragePath(session.user.id, item.path));
-      await logActivity(session.user.id, 'video_deleted', null, 'Video eliminato dalla libreria');
-      setVideos(current => current.filter(v => v.id !== item.id));
+      const { error: metadataDeleteError } = await supabase
+        .from('vault_video_meta')
+        .delete()
+        .eq('user_id', session.user.id)
+        .eq('storage_path', metadataStoragePath(session.user.id, item.path));
+      if (metadataDeleteError) {
+        console.warn('File eliminato ma metadati da ripulire:', metadataDeleteError.message);
+        setError('Il video è stato eliminato dal cloud, ma alcuni metadati non sono stati ripuliti. Aggiorna la libreria.');
+      } else {
+        setMessage('Video eliminato definitivamente.');
+      }
       if (shareItem?.id === item.id) {
         setShareItem(null);
         setShareUrl('');
       }
-      await loadSecurityData();
+      await Promise.all([loadVideos(), loadSecurityData()]);
+    } catch (deleteError) {
+      setError('Non sono riuscito a eliminare definitivamente il video: ' + (deleteError.message || 'errore sconosciuto'));
+    } finally {
+      setTrashActionId('');
+    }
+  }
+
+  async function runIntegrityCheck() {
+    if (!session?.user?.id || !vaultKey || integrityChecking || !videos.length || uploading || rotationBusy || metadataMigrationBusy) return;
+    const targets = [...videos];
+    const confirmed = window.confirm(
+      'Vault controllerà l’impronta SHA-256 di ' + targets.length + ' video. Per Backblaze il contenuto cifrato verrà letto integralmente dal server; su Google verrà usato il checksum fornito dal provider quando disponibile. La verifica può richiedere tempo e generare traffico di lettura, ma non modifica né scarica i video sul tuo dispositivo. Vuoi continuare?'
+    );
+    if (!confirmed) return;
+
+    setIntegrityChecking(true);
+    setIntegrityProgress('Preparazione dei controlli…');
+    setIntegrityResults([]);
+    setError('');
+    const results = [];
+    try {
+      for (let index = 0; index < targets.length; index++) {
+        const item = targets[index];
+        const displayName = item.displayName || getDisplayName(item.name);
+        setIntegrityProgress('Verifica ' + (index + 1) + ' di ' + targets.length + ': ' + displayName);
+        try {
+          const providerResult = item.provider === 'google'
+            ? await googleRequest(session, { action: 'integrity', accountId: item.accountId, fileId: item.fileId })
+            : await b2Request(session, { action: 'integrity', path: item.path });
+          const actual = providerResult.data || {};
+          if (!/^[0-9a-f]{64}$/i.test(actual.sha256 || '') || !Number.isSafeInteger(Number(actual.size)) || Number(actual.size) <= 0) {
+            throw new Error('Il provider non ha restituito un checksum SHA-256 e una dimensione validi.');
+          }
+
+          const metadata = await readMetadataForVideo(item);
+          const previousHash = /^[0-9a-f]{64}$/i.test(metadata.integritySha256 || '')
+            ? metadata.integritySha256.toLowerCase()
+            : '';
+          const previousSize = Number(metadata.integritySize || 0);
+          const actualHash = actual.sha256.toLowerCase();
+          const actualSize = Number(actual.size);
+          let status;
+          let detail;
+          const checkedAt = new Date().toISOString();
+          const nextMetadata = { ...metadata, integrityLastCheckedAt: checkedAt };
+          if (!previousHash) {
+            status = 'baseline';
+            detail = 'Prima impronta SHA-256 salvata. I prossimi controlli potranno confrontare il file con questo riferimento.';
+            nextMetadata.integritySha256 = actualHash;
+            nextMetadata.integritySize = actualSize;
+          } else if (previousHash !== actualHash || (previousSize > 0 && previousSize !== actualSize)) {
+            status = 'mismatch';
+            detail = 'Il contenuto attuale non coincide con l’impronta salvata in precedenza. Nessuna copia è stata sostituita o eliminata.';
+          } else {
+            status = 'verified';
+            detail = 'SHA-256 e dimensione coincidono con l’impronta salvata.';
+          }
+          nextMetadata.integrityLastStatus = status;
+          await saveEncryptedVideoMetadata(
+            session.user.id,
+            metadataStoragePath(session.user.id, item.path),
+            nextMetadata,
+            vaultKey
+          );
+          const resultRow = { id: item.id, name: displayName, provider: item.providerLabel, status, detail, checkedAt };
+          results.push(resultRow);
+          setVideos(current => current.map(video => video.id === item.id ? {
+            ...video,
+            vaultMetadata: nextMetadata,
+            encryptedMetadata: true,
+            integritySha256: nextMetadata.integritySha256 || '',
+            integritySize: Number(nextMetadata.integritySize || 0),
+            integrityLastStatus: status,
+            integrityLastCheckedAt: checkedAt,
+          } : video));
+        } catch (itemError) {
+          results.push({
+            id: item.id,
+            name: displayName,
+            provider: item.providerLabel,
+            status: 'error',
+            detail: itemError.message || 'Errore durante il controllo.',
+            checkedAt: new Date().toISOString(),
+          });
+        }
+        setIntegrityResults([...results]);
+      }
+      setIntegrityRunAt(new Date().toISOString());
+      const mismatches = results.filter(result => result.status === 'mismatch').length;
+      const errors = results.filter(result => result.status === 'error').length;
+      const baselines = results.filter(result => result.status === 'baseline').length;
+      const verified = results.filter(result => result.status === 'verified').length;
+      setMessage(
+        'Controllo completato: ' + verified + ' verificati, ' + baselines + ' prime impronte salvate, ' +
+        mismatches + ' anomalie' + (errors ? ', ' + errors + ' non controllati.' : '.')
+      );
+    } finally {
+      setIntegrityChecking(false);
+      setIntegrityProgress('');
     }
   }
 
