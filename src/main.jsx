@@ -270,8 +270,12 @@ async function updateEncryptedVideoMetadata(userId, storagePath, key, fallbackMe
     if (readError) throw new Error('Non riesco a leggere i metadati cifrati: ' + readError.message);
 
     let currentMetadata = fallbackMetadata;
-    const previousCiphertext = row?.encrypted_metadata || null;
-    if (previousCiphertext) {
+    const rowExists = Boolean(row);
+    const previousCiphertext = row?.encrypted_metadata ?? null;
+    if (rowExists) {
+      if (typeof previousCiphertext !== 'string' || !previousCiphertext) {
+        throw new Error('Esiste una riga di metadati senza contenuto cifrato. Non la sovrascrivo automaticamente.');
+      }
       currentMetadata = await openVideoMetadata(previousCiphertext, key);
       if (!currentMetadata) {
         throw new Error('I metadati cifrati non sono leggibili con la chiave attuale. Non li sovrascrivo per evitare di perdere il titolo originale.');
@@ -284,7 +288,7 @@ async function updateEncryptedVideoMetadata(userId, storagePath, key, fallbackMe
     }
     const encryptedMetadata = await sealVideoMetadata(nextMetadata, key);
 
-    if (previousCiphertext) {
+    if (rowExists) {
       const { data: updatedRow, error: updateError } = await supabase
         .from('vault_video_meta')
         .update({ encrypted_metadata: encryptedMetadata })
@@ -1897,7 +1901,7 @@ function App() {
       ? 'unknown'
       : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0)
         ? 'weak'
-        : (missingMetadataCount > 0)
+        : (missingMetadataCount > 0 || integrityPendingCount > 0 || integrityBaselineCount > 0)
           ? 'check'
           : 'good';
   const securityReasons = [];
@@ -1905,8 +1909,10 @@ function App() {
   if (visibleStorageNameCount > 0) securityReasons.push(visibleStorageNameCount + ' file hanno ancora un nome riconoscibile nello spazio cloud.');
   if (missingMetadataCount > 0) securityReasons.push('I metadati cifrati del titolo non sono disponibili per ' + missingMetadataCount + ' video.');
   if (integrityMismatchCount > 0) securityReasons.push(integrityMismatchCount + ' video non corrispondono alla loro impronta SHA-256 salvata. Non sono stati modificati automaticamente.');
+  if (integrityPendingCount > 0) securityReasons.push(integrityPendingCount + ' video non hanno ancora una verifica SHA-256 completata.');
+  if (integrityBaselineCount > 0) securityReasons.push(integrityBaselineCount + ' video hanno soltanto la prima impronta di riferimento; un controllo successivo serve per confrontare i dati nel tempo.');
   const securitySummary = securityState === 'good'
-    ? 'I video elencati risultano cifrati e salvati con nomi casuali.'
+    ? 'I video attivi risultano cifrati, hanno nomi casuali e le ultime impronte SHA-256 coincidono con i riferimenti salvati.'
     : securityState === 'weak'
       ? 'Ci sono elementi da proteggere: controlla i motivi indicati qui sotto.'
       : securityState === 'check'
