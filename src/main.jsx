@@ -258,6 +258,62 @@ async function saveEncryptedVideoMetadata(userId, storagePath, metadata, key) {
   if (error) throw new Error('Metadati cifrati non salvati: ' + error.message);
 }
 
+async function updateEncryptedVideoMetadata(userId, storagePath, key, fallbackMetadata, updateMetadata) {
+  const maxAttempts = 4;
+  for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    const { data: row, error: readError } = await supabase
+      .from('vault_video_meta')
+      .select('encrypted_metadata')
+      .eq('user_id', userId)
+      .eq('storage_path', storagePath)
+      .maybeSingle();
+    if (readError) throw new Error('Non riesco a leggere i metadati cifrati: ' + readError.message);
+
+    let currentMetadata = fallbackMetadata;
+    const previousCiphertext = row?.encrypted_metadata || null;
+    if (previousCiphertext) {
+      currentMetadata = await openVideoMetadata(previousCiphertext, key);
+      if (!currentMetadata) {
+        throw new Error('I metadati cifrati non sono leggibili con la chiave attuale. Non li sovrascrivo per evitare di perdere il titolo originale.');
+      }
+    }
+
+    const nextMetadata = await updateMetadata({ ...currentMetadata });
+    if (!nextMetadata || typeof nextMetadata.name !== 'string' || typeof nextMetadata.mime !== 'string') {
+      throw new Error('Aggiornamento metadati non valido.');
+    }
+    const encryptedMetadata = await sealVideoMetadata(nextMetadata, key);
+
+    if (previousCiphertext) {
+      const { data: updatedRow, error: updateError } = await supabase
+        .from('vault_video_meta')
+        .update({ encrypted_metadata: encryptedMetadata })
+        .eq('user_id', userId)
+        .eq('storage_path', storagePath)
+        .eq('encrypted_metadata', previousCiphertext)
+        .select('storage_path')
+        .maybeSingle();
+      if (updateError) throw new Error('Metadati cifrati non aggiornati: ' + updateError.message);
+      if (updatedRow) return nextMetadata;
+    } else {
+      const { data: insertedRow, error: insertError } = await supabase
+        .from('vault_video_meta')
+        .insert({
+          user_id: userId,
+          storage_path: storagePath,
+          encrypted_metadata: encryptedMetadata,
+        })
+        .select('storage_path')
+        .maybeSingle();
+      if (!insertError && insertedRow) return nextMetadata;
+      if (insertError && insertError.code !== '23505') {
+        throw new Error('Metadati cifrati non salvati: ' + insertError.message);
+      }
+    }
+  }
+  throw new Error('I metadati sono stati modificati contemporaneamente su un altro dispositivo. Aggiorna la libreria e riprova.');
+}
+
 async function loadEncryptedVideoMetadata(userId, paths, key) {
   if (!paths.length) return new Map();
   const result = new Map();
@@ -1273,38 +1329,45 @@ function App() {
       throw new Error('Il provider non ha restituito un checksum SHA-256 e una dimensione validi.');
     }
 
-    const metadata = await readMetadataForVideo(item);
-    const previousHash = /^[0-9a-f]{64}$/i.test(metadata.integritySha256 || '')
-      ? metadata.integritySha256.toLowerCase()
-      : '';
-    const previousSize = Number(metadata.integritySize || 0);
     const actualHash = actual.sha256.toLowerCase();
     const actualSize = Number(actual.size);
     const checkedAt = new Date().toISOString();
-    const nextMetadata = { ...metadata, integrityLastCheckedAt: checkedAt };
-    let status;
-    let detail;
+    let status = 'pending';
+    let detail = '';
 
-    if (!previousHash) {
-      status = 'baseline';
-      detail = 'Prima impronta SHA-256 salvata. I prossimi controlli potranno confrontare il file con questo riferimento.';
-      nextMetadata.integritySha256 = actualHash;
-      nextMetadata.integritySize = actualSize;
-    } else if (previousHash !== actualHash || (previousSize > 0 && previousSize !== actualSize)) {
-      status = 'mismatch';
-      detail = 'Il contenuto attuale non coincide con l’impronta salvata in precedenza. Nessuna copia è stata sostituita o eliminata.';
-    } else {
-      status = 'verified';
-      detail = 'SHA-256 e dimensione coincidono con l’impronta salvata.';
-    }
-
-    nextMetadata.integrityLastStatus = status;
-    await saveEncryptedVideoMetadata(
+    const fallbackMetadata = {
+      name: item.displayName || getDisplayName(item.name),
+      mime: item.mime || getOriginalVideoMime(item.name),
+    };
+    const metadata = await updateEncryptedVideoMetadata(
       session.user.id,
       metadataStoragePath(session.user.id, item.path),
-      nextMetadata,
-      vaultKey
+      vaultKey,
+      fallbackMetadata,
+      currentMetadata => {
+        const previousHash = /^[0-9a-f]{64}$/i.test(currentMetadata.integritySha256 || '')
+          ? currentMetadata.integritySha256.toLowerCase()
+          : '';
+        const previousSize = Number(currentMetadata.integritySize || 0);
+        const nextMetadata = { ...currentMetadata, integrityLastCheckedAt: checkedAt };
+
+        if (!previousHash) {
+          status = 'baseline';
+          detail = 'Prima impronta SHA-256 salvata. I prossimi controlli potranno confrontare il file con questo riferimento.';
+          nextMetadata.integritySha256 = actualHash;
+          nextMetadata.integritySize = actualSize;
+        } else if (previousHash !== actualHash || (previousSize > 0 && previousSize !== actualSize)) {
+          status = 'mismatch';
+          detail = 'Il contenuto attuale non coincide con l’impronta salvata in precedenza. Nessuna copia è stata sostituita o eliminata.';
+        } else {
+          status = 'verified';
+          detail = 'SHA-256 e dimensione coincidono con l’impronta salvata.';
+        }
+        nextMetadata.integrityLastStatus = status;
+        return nextMetadata;
+      }
     );
+
     return {
       result: {
         id: item.id,
@@ -1314,7 +1377,7 @@ function App() {
         detail,
         checkedAt,
       },
-      metadata: nextMetadata,
+      metadata,
     };
   }
 
@@ -1496,7 +1559,6 @@ function App() {
     setTrashActionId(item.id);
     setError('');
     try {
-      const metadata = await readMetadataForVideo(item);
       const { data: linkedShares, error: sharesError } = await supabase
         .from('vault_shares')
         .select('id,storage_path')
@@ -1513,11 +1575,15 @@ function App() {
         if (markSharesError) throw new Error('Le copie dei link sono state rimosse, ma non riesco ad aggiornare il registro: ' + markSharesError.message);
       }
       const trashedAt = new Date().toISOString();
-      await saveEncryptedVideoMetadata(
+      await updateEncryptedVideoMetadata(
         session.user.id,
         metadataStoragePath(session.user.id, item.path),
-        { ...metadata, trashedAt },
-        vaultKey
+        vaultKey,
+        {
+          name: item.displayName || getDisplayName(item.name),
+          mime: item.mime || getOriginalVideoMime(item.name),
+        },
+        currentMetadata => ({ ...currentMetadata, trashedAt })
       );
       await logActivity(session.user.id, 'video_deleted', null, 'Video spostato nel cestino; file conservato nello spazio cloud.');
       setMessage('Video spostato nel cestino. Il file è ancora conservato e può essere ripristinato.');
@@ -1534,13 +1600,19 @@ function App() {
     setTrashActionId(item.id);
     setError('');
     try {
-      const metadata = await readMetadataForVideo(item);
-      const { trashedAt, ...restoredMetadata } = metadata;
-      await saveEncryptedVideoMetadata(
+      await updateEncryptedVideoMetadata(
         session.user.id,
         metadataStoragePath(session.user.id, item.path),
-        restoredMetadata,
-        vaultKey
+        vaultKey,
+        {
+          name: item.displayName || getDisplayName(item.name),
+          mime: item.mime || getOriginalVideoMime(item.name),
+          trashedAt: item.trashedAt,
+        },
+        currentMetadata => {
+          const { trashedAt, ...restoredMetadata } = currentMetadata;
+          return restoredMetadata;
+        }
       );
       setMessage('Video ripristinato nella galleria.');
       await loadVideos();
@@ -1819,13 +1891,15 @@ function App() {
   const integrityVerifiedCount = videos.filter(item => item.integrityLastStatus === 'verified').length;
   const integrityBaselineCount = videos.filter(item => item.integrityLastStatus === 'baseline').length;
   const integrityPendingCount = videos.filter(item => !['verified', 'mismatch', 'baseline'].includes(item.integrityLastStatus)).length;
-  const securityState = !activeVideos.length
-    ? 'unknown'
-    : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0 || integrityMismatchCount > 0)
-      ? 'weak'
-      : (missingMetadataCount > 0)
-        ? 'check'
-        : 'good';
+  const securityState = integrityMismatchCount > 0
+    ? 'weak'
+    : !activeVideos.length
+      ? 'unknown'
+      : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0)
+        ? 'weak'
+        : (missingMetadataCount > 0)
+          ? 'check'
+          : 'good';
   const securityReasons = [];
   if (unencryptedVideoCount > 0) securityReasons.push(unencryptedVideoCount + ' video non risultano cifrati (non hanno il formato .vlt).');
   if (visibleStorageNameCount > 0) securityReasons.push(visibleStorageNameCount + ' file hanno ancora un nome riconoscibile nello spazio cloud.');
