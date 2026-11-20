@@ -242,7 +242,7 @@ async function openVideoMetadata(value, key) {
     const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: packed.slice(0, 12) }, key, packed.slice(12));
     const parsed = JSON.parse(new TextDecoder().decode(plain));
     if (typeof parsed.name !== 'string' || typeof parsed.mime !== 'string') return null;
-    return { name: parsed.name, mime: parsed.mime };
+    return parsed;
   } catch {
     return null;
   }
@@ -413,6 +413,12 @@ function App() {
   const [loadingVideos, setLoadingVideos] = useState(false);
   const [activeSection, setActiveSection] = useState('gallery');
   const [dataUpdatedAt, setDataUpdatedAt] = useState(null);
+  const [trashOpen, setTrashOpen] = useState(false);
+  const [trashActionId, setTrashActionId] = useState('');
+  const [integrityChecking, setIntegrityChecking] = useState(false);
+  const [integrityProgress, setIntegrityProgress] = useState('');
+  const [integrityResults, setIntegrityResults] = useState([]);
+  const [integrityRunAt, setIntegrityRunAt] = useState(null);
   const [uploading, setUploading] = useState(false);
   const [progressName, setProgressName] = useState('');
   const [shareItem, setShareItem] = useState(null);
@@ -624,6 +630,12 @@ function App() {
           item.displayName = metadata.name;
           item.mime = metadata.mime;
           item.encryptedMetadata = true;
+          item.vaultMetadata = metadata;
+          item.trashedAt = typeof metadata.trashedAt === 'string' ? metadata.trashedAt : null;
+          item.integritySha256 = typeof metadata.integritySha256 === 'string' ? metadata.integritySha256 : '';
+          item.integritySize = Number(metadata.integritySize || 0);
+          item.integrityLastStatus = metadata.integrityLastStatus || 'pending';
+          item.integrityLastCheckedAt = metadata.integrityLastCheckedAt || null;
         }
       }
     } catch (metadataError) {
@@ -1485,9 +1497,13 @@ function App() {
     }
   }
 
-  const visibleVideos = useMemo(() => videos
+  const activeVideos = useMemo(() => videos.filter(video => !video.trashedAt), [videos]);
+  const trashedVideos = useMemo(() => videos
+    .filter(video => Boolean(video.trashedAt))
+    .sort((a, b) => new Date(b.trashedAt || 0) - new Date(a.trashedAt || 0)), [videos]);
+  const visibleVideos = useMemo(() => activeVideos
     .filter(video => (video.displayName || video.name).toLowerCase().includes(search.toLowerCase()))
-    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)), [videos, search]);
+    .sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0)), [activeVideos, search]);
   const securityAlerts = shares.filter(share => !share.revoked_at && new Date(share.expires_at).getTime() <= nowTick + 15 * 60 * 1000);
   useEffect(() => {
     if (!notificationsEnabled || !('Notification' in window) || Notification.permission !== 'granted') return;
@@ -1523,21 +1539,26 @@ function App() {
   const otherGoogleSegment = hasDriveBreakdown
     ? Math.max(0, driveTotalUsedBytes - driveVideoSegment - driveOtherFilesSegment)
     : Math.max(0, driveTotalUsedBytes - driveVideoSegment);
-  const unencryptedVideoCount = videos.filter(item => !item.encrypted).length;
-  const visibleStorageNameCount = videos.filter(item => !isOpaqueVaultName(item.name)).length;
-  const missingMetadataCount = videos.filter(item => item.encrypted && !item.encryptedMetadata).length;
+  const unencryptedVideoCount = activeVideos.filter(item => !item.encrypted).length;
+  const visibleStorageNameCount = activeVideos.filter(item => !isOpaqueVaultName(item.name)).length;
+  const missingMetadataCount = activeVideos.filter(item => item.encrypted && !item.encryptedMetadata).length;
   const activeLinkCount = shares.filter(share => !share.revoked_at && new Date(share.expires_at).getTime() > nowTick).length;
-  const securityState = !videos.length
+  const integrityMismatchCount = videos.filter(item => item.integrityLastStatus === 'mismatch').length;
+  const integrityVerifiedCount = videos.filter(item => item.integrityLastStatus === 'verified').length;
+  const integrityBaselineCount = videos.filter(item => item.integrityLastStatus === 'baseline').length;
+  const integrityPendingCount = videos.filter(item => !['verified', 'mismatch', 'baseline'].includes(item.integrityLastStatus)).length;
+  const securityState = !activeVideos.length
     ? 'unknown'
-    : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0)
+    : (unencryptedVideoCount > 0 || visibleStorageNameCount > 0 || integrityMismatchCount > 0)
       ? 'weak'
-      : missingMetadataCount > 0
+      : (missingMetadataCount > 0)
         ? 'check'
         : 'good';
   const securityReasons = [];
   if (unencryptedVideoCount > 0) securityReasons.push(unencryptedVideoCount + ' video non risultano cifrati (non hanno il formato .vlt).');
   if (visibleStorageNameCount > 0) securityReasons.push(visibleStorageNameCount + ' file hanno ancora un nome riconoscibile nello spazio cloud.');
   if (missingMetadataCount > 0) securityReasons.push('I metadati cifrati del titolo non sono disponibili per ' + missingMetadataCount + ' video.');
+  if (integrityMismatchCount > 0) securityReasons.push(integrityMismatchCount + ' video non corrispondono alla loro impronta SHA-256 salvata. Non sono stati modificati automaticamente.');
   const securitySummary = securityState === 'good'
     ? 'I video elencati risultano cifrati e salvati con nomi casuali.'
     : securityState === 'weak'
@@ -1618,7 +1639,7 @@ function App() {
       </header>
       <nav className="vault-navigation" aria-label="Sezioni di Vault">
         <button type="button" className={'vault-nav-tab ' + (activeSection === 'gallery' ? 'active' : '')} onClick={() => setActiveSection('gallery')} aria-current={activeSection === 'gallery' ? 'page' : undefined}>
-          <Film size={17}/> Galleria <span>{videos.length}</span>
+          <Film size={17}/> Galleria <span>{activeVideos.length}</span>
         </button>
         <button type="button" className={'vault-nav-tab ' + (activeSection === 'overview' ? 'active' : '')} onClick={() => setActiveSection('overview')} aria-current={activeSection === 'overview' ? 'page' : undefined}>
           <Activity size={17}/> Panoramica
@@ -1762,9 +1783,9 @@ function App() {
       )}
       {activeSection === 'gallery' && (
       <section className="library">
-        <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{videos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div></div></div>
+        <div className="library-head"><div><div className="section-kicker">IL TUO ARCHIVIO</div><h2>I miei video <span>{visibleVideos.length}/{activeVideos.length}</span></h2></div><div className="library-tools"><div className="search-box"><input value={search} onChange={e => setSearch(e.target.value)} placeholder="Cerca un video…" aria-label="Cerca un video"/></div><button className="trash-open-btn" type="button" onClick={() => setTrashOpen(true)}><Trash2 size={15}/> Cestino <span>{trashedVideos.length}</span></button></div></div>
         {loadingVideos ? <div className="empty-state"><LoaderCircle className="spin" size={24}/><p>Sto aprendo la cassaforte…</p></div> : visibleVideos.length === 0 ? (
-          <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{videos.length ? 'Nessun risultato' : 'La tua cassaforte è vuota'}</h3><p>{videos.length ? 'Prova con un altro nome.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.'}</p>{!videos.length && <button className="secondary-btn" type="button" onClick={openUploadDestination}><UploadCloud size={17}/> Seleziona video</button>}</div>
+          <div className="empty-state"><div className="empty-icon"><Film size={27}/></div><h3>{activeVideos.length ? 'Nessun risultato' : 'La tua galleria è vuota'}</h3><p>{activeVideos.length ? 'Prova con un altro nome.' : (trashedVideos.length ? 'I tuoi video sono nel cestino: puoi ripristinarli quando vuoi.' : 'Carica il tuo primo video: resterà privato finché non deciderai di condividerlo.')}</p>{!activeVideos.length && !trashedVideos.length && <button className="secondary-btn" type="button" onClick={openUploadDestination}><UploadCloud size={17}/> Seleziona video</button>}{!activeVideos.length && trashedVideos.length > 0 && <button className="secondary-btn" type="button" onClick={() => setTrashOpen(true)}><Trash2 size={16}/> Apri cestino</button>}</div>
         ) : (
           <div className="video-grid">{visibleVideos.map(item => (
             <article className="video-card" key={item.id}>
