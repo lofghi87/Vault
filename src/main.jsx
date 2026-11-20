@@ -472,6 +472,7 @@ function App() {
   const [nowTick, setNowTick] = useState(() => Date.now());
   const notifiedShareIds = useRef(new Set());
   const automaticIntegrityStartedRef = useRef(false);
+  const automaticIntegrityTimerRef = useRef(null);
   const videoElementRef = useRef(null);
   const uploadInputRef = useRef(null);
   const uploadDestinationRef = useRef('backblaze');
@@ -1052,6 +1053,10 @@ function App() {
   }
 
   async function handleLogout() {
+    if (integrityChecking) {
+      setMessage('Attendi il termine del controllo di integrità prima di uscire.');
+      return;
+    }
     if (!window.confirm('Vuoi davvero uscire dal tuo account Vault?')) return;
     setVaultKey(null);
     if (previewUrl) URL.revokeObjectURL(previewUrl);
@@ -1122,6 +1127,10 @@ function App() {
     const selected = Array.from(event.target.files || []);
     event.target.value = '';
     if (!selected.length || !session?.user?.id) return;
+    if (integrityChecking || trashActionId) {
+      setError('Attendi il termine dell’operazione in corso prima di caricare o modificare i video.');
+      return;
+    }
     const invalid = selected.find(file => !file.type.startsWith('video/'));
     if (invalid) {
       setError('Puoi caricare soltanto file video.');
@@ -1193,7 +1202,7 @@ function App() {
   }
 
   async function openEncryptedVideo(item) {
-    if (!vaultKey || openingVideoId) return;
+    if (!vaultKey || openingVideoId || integrityChecking || trashActionId) return;
     setOpeningVideoId(item.id);
     setError('');
     try {
@@ -1295,6 +1304,7 @@ function App() {
   }
 
   function beginRename(item) {
+    if (integrityChecking || trashActionId) return;
     setRenameItem(item);
     setRenameValue((item.displayName || getDisplayName(item.name)).replace(/\.[^.]+$/, ''));
     setError('');
@@ -1466,8 +1476,8 @@ function App() {
   }
 
   async function deleteVideo(item) {
-    if (!item || item.trashedAt || trashActionId) return;
-    if (!window.confirm('Spostare "' + (item.displayName || 'questo video') + '" nel cestino? Il file resterà nello spazio cloud e continuerà a occupare quota. Potrai ripristinarlo oppure eliminarlo definitivamente dal cestino.')) return;
+    if (!item || item.trashedAt || trashActionId || integrityChecking) return;
+    if (!window.confirm('Spostare "' + (item.displayName || 'questo video') + '" nel cestino? Il file resterà nello spazio cloud e continuerà a occupare quota. Gli eventuali link temporanei collegati verranno revocati. Potrai ripristinarlo oppure eliminarlo definitivamente dal cestino.')) return;
     setTrashActionId(item.id);
     setError('');
     try {
@@ -1505,7 +1515,7 @@ function App() {
   }
 
   async function restoreVideo(item) {
-    if (!item?.trashedAt || trashActionId) return;
+    if (!item?.trashedAt || trashActionId || integrityChecking) return;
     setTrashActionId(item.id);
     setError('');
     try {
@@ -1527,7 +1537,7 @@ function App() {
   }
 
   async function permanentlyDeleteVideo(item) {
-    if (!item?.trashedAt || trashActionId) return;
+    if (!item?.trashedAt || trashActionId || integrityChecking) return;
     if (!window.confirm('Eliminare definitivamente "' + (item.displayName || 'questo video') + '"? Il file verrà rimosso dal provider cloud e non potrà essere recuperato da Vault.')) return;
     setTrashActionId(item.id);
     setError('');
@@ -1578,6 +1588,10 @@ function App() {
 
   async function runIntegrityCheck() {
     if (!session?.user?.id || !vaultKey || integrityChecking || trashActionId || renameBusy || !videos.length || uploading || rotationBusy || metadataMigrationBusy) return;
+    if (automaticIntegrityTimerRef.current) {
+      window.clearTimeout(automaticIntegrityTimerRef.current);
+      automaticIntegrityTimerRef.current = null;
+    }
     const targets = [...videos];
     const confirmed = window.confirm(
       'Vault controllerà l’impronta SHA-256 di ' + targets.length + ' video. Per Backblaze il contenuto cifrato verrà letto integralmente dal server; su Google verrà usato il checksum fornito dal provider quando disponibile. La verifica può richiedere tempo e generare traffico di lettura, ma non modifica né scarica i video sul tuo dispositivo. Vuoi continuare?'
@@ -1890,6 +1904,90 @@ function App() {
     };
   }, [session?.user?.id, vaultKey, loadingVideos, videos, uploading, rotationBusy, metadataMigrationBusy, integrityChecking, trashActionId, renameBusy]);
 
+  useEffect(() => {
+    automaticIntegrityStartedRef.current = false;
+  }, [session?.user?.id, vaultKey]);
+
+  useEffect(() => {
+    if (!session?.user?.id || !vaultKey || loadingVideos || !videos.length ||
+        uploading || rotationBusy || metadataMigrationBusy || integrityChecking ||
+        trashActionId || renameBusy || automaticIntegrityStartedRef.current) return;
+
+    const maxAgeMs = 30 * 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const dueItems = videos
+      .filter(item => {
+        const lastChecked = item.integrityLastCheckedAt ? new Date(item.integrityLastCheckedAt).getTime() : 0;
+        return !Number.isFinite(lastChecked) || lastChecked === 0 || now - lastChecked >= maxAgeMs;
+      })
+      .sort((a, b) => {
+        const aDate = a.integrityLastCheckedAt ? new Date(a.integrityLastCheckedAt).getTime() : 0;
+        const bDate = b.integrityLastCheckedAt ? new Date(b.integrityLastCheckedAt).getTime() : 0;
+        return aDate - bDate;
+      });
+    if (!dueItems.length) return;
+
+    const candidate = dueItems[0];
+    automaticIntegrityStartedRef.current = true;
+    let cancelled = false;
+    let started = false;
+    setIntegrityChecking(true);
+    setIntegrityProgress('Controllo automatico programmato: ' + (candidate.displayName || getDisplayName(candidate.name)));
+    const timer = window.setTimeout(async () => {
+      started = true;
+      automaticIntegrityTimerRef.current = null;
+      if (cancelled) return;
+      try {
+        const checked = await verifyVideoIntegrity(candidate);
+        if (cancelled) return;
+        setVideos(current => current.map(video => video.id === candidate.id ? {
+          ...video,
+          vaultMetadata: checked.metadata,
+          encryptedMetadata: true,
+          integritySha256: checked.metadata.integritySha256 || '',
+          integritySize: Number(checked.metadata.integritySize || 0),
+          integrityLastStatus: checked.metadata.integrityLastStatus || 'pending',
+          integrityLastCheckedAt: checked.metadata.integrityLastCheckedAt || null,
+        } : video));
+        setIntegrityResults([checked.result]);
+        setIntegrityRunAt(new Date().toISOString());
+        setMessage(checked.result.status === 'mismatch'
+          ? 'Controllo automatico: rilevata un’anomalia in "' + checked.result.name + '". Consulta la Panoramica.'
+          : checked.result.status === 'baseline'
+            ? 'Controllo automatico: salvata la prima impronta di "' + checked.result.name + '".'
+            : 'Controllo automatico completato per "' + checked.result.name + '".');
+      } catch (checkError) {
+        if (!cancelled) {
+          setIntegrityResults([{
+            id: candidate.id,
+            name: candidate.displayName || getDisplayName(candidate.name),
+            provider: candidate.providerLabel,
+            status: 'error',
+            detail: checkError.message || 'Errore durante il controllo automatico.',
+            checkedAt: new Date().toISOString(),
+          }]);
+          setError('Controllo automatico non completato: ' + (checkError.message || 'errore sconosciuto') + '. Puoi riprovare da Panoramica.');
+        }
+      } finally {
+        if (!cancelled) {
+          setIntegrityChecking(false);
+          setIntegrityProgress('');
+        }
+      }
+    }, 1200);
+    automaticIntegrityTimerRef.current = timer;
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+      if (automaticIntegrityTimerRef.current === timer) automaticIntegrityTimerRef.current = null;
+      if (!started) {
+        automaticIntegrityStartedRef.current = false;
+        setIntegrityChecking(false);
+        setIntegrityProgress('');
+      }
+    };
+  }, [session?.user?.id, vaultKey, loadingVideos]);
+
   if (incomingShare) return (
     <main className="auth-page incoming-share-page">
       <div className="auth-top"><div className="brand"><div className="brand-icon"><img src="/vault-logo.svg" alt=""/></div><span>VAULT</span></div><span className="top-note"><Clock3 size={14}/> LINK TEMPORANEO</span></div>
@@ -1966,7 +2064,7 @@ function App() {
         <section className="welcome">
           <div><div className="eyebrow"><span className="pulse-dot"/> IL TUO SPAZIO PERSONALE</div><h1>La tua <span>galleria.</span></h1><p>I tuoi video privati, ordinati in un unico posto. I nuovi caricamenti vengono cifrati sul dispositivo.</p></div>
           <div className="welcome-actions">
-            <button className="upload-btn" type="button" onClick={openUploadDestination}><UploadCloud size={18}/> Carica video</button>
+            <button className="upload-btn" type="button" onClick={openUploadDestination} disabled={integrityChecking || trashActionId !== ''}><UploadCloud size={18}/> Carica video</button>
           </div>
         </section>
       ) : (
@@ -1977,7 +2075,7 @@ function App() {
             <p>Spazio occupato, account collegati e controlli di protezione.</p>
             <div className="overview-updated">{dataUpdatedAt ? 'Dati aggiornati il ' + new Date(dataUpdatedAt).toLocaleString('it-IT', { dateStyle: 'short', timeStyle: 'short' }) : 'Dati non ancora aggiornati'}</div>
           </div>
-          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading}>
+          <button className="overview-refresh-btn" type="button" onClick={async () => { setError(''); await Promise.all([loadVideos(), loadSecurityData()]); }} disabled={loadingVideos || securityLoading || integrityChecking}>
             {loadingVideos || securityLoading ? <LoaderCircle className="spin" size={16}/> : <RefreshCw size={16}/>}
             Aggiorna dati
           </button>
@@ -2099,7 +2197,7 @@ function App() {
                 <div>
                   <span className="overview-eyebrow">CONTROLLO DEI CONTENUTI</span>
                   <h3>Integrità dei video</h3>
-                  <p>Confronta i file cifrati con le impronte SHA-256 conservate nei metadati cifrati di Vault.</p>
+                  <p>Confronta i file cifrati con le impronte SHA-256 conservate nei metadati cifrati di Vault. In automatico controlla un video da verificare per ogni sblocco e ricontrolla ogni video almeno ogni 30 giorni; puoi avviare una verifica completa quando preferisci.</p>
                 </div>
                 <button
                   className="overview-refresh-btn"
@@ -2151,7 +2249,7 @@ function App() {
           <div className="video-grid">{visibleVideos.map(item => (
             <article className="video-card" key={item.id}>
               <button className="video-preview encrypted-preview" style={thumbnails[item.path] ? { backgroundImage: 'linear-gradient(#0002,#0002),url("' + thumbnails[item.path] + '")', backgroundSize: 'cover', backgroundPosition: 'center' } : undefined} disabled={openingVideoId !== null} onClick={() => item.encrypted ? openEncryptedVideo(item) : setError('Questo è un vecchio video non cifrato. Scaricalo e ricaricalo dopo la modifica per proteggerlo.') }>{thumbnails[item.path] ? <span className="thumb-play"><Play size={24} fill="currentColor"/></span> : <div className="video-placeholder">{openingVideoId === item.id ? <><LoaderCircle className="spin" size={32}/><span>APERTURA IN CORSO…</span></> : <><LockKeyhole size={32}/><span>{item.encrypted ? 'CIFRATO' : 'NON CIFRATO'}</span></>}</div>}<span className="private-tag"><LockKeyhole size={11}/> {item.encrypted ? 'AES-256' : 'VECCHIO FILE'}</span></button>
-              <div className="video-info"><h3 title={item.displayName}>{item.displayName}</h3><div className="video-source"><HardDrive size={12}/>{item.providerLabel || 'Backblaze B2'}</div><div className="video-meta"><span><Clock3 size={13}/>{formatDate(item.created_at)}</span><span>{formatSize(item.size)}</span></div><div className="video-actions"><button className="share-btn" disabled={openingVideoId !== null} onClick={() => createShare(item)}><Share2 size={14}/> Condividi</button>{item.encrypted && <button className="delete-btn" onClick={() => beginRename(item)} title="Modifica nome"><Pencil size={16}/></button>}<button className="delete-btn" onClick={() => deleteVideo(item)} title="Sposta nel cestino" disabled={trashActionId === item.id}><Trash2 size={16}/></button></div></div>
+              <div className="video-info"><h3 title={item.displayName}>{item.displayName}</h3><div className="video-source"><HardDrive size={12}/>{item.providerLabel || 'Backblaze B2'}</div><div className="video-meta"><span><Clock3 size={13}/>{formatDate(item.created_at)}</span><span>{formatSize(item.size)}</span></div><div className="video-actions"><button className="share-btn" disabled={openingVideoId !== null || integrityChecking || Boolean(trashActionId)} onClick={() => createShare(item)}><Share2 size={14}/> Condividi</button>{item.encrypted && <button className="delete-btn" onClick={() => beginRename(item)} title="Modifica nome"><Pencil size={16}/></button>}<button className="delete-btn" onClick={() => deleteVideo(item)} title="Sposta nel cestino" disabled={Boolean(trashActionId) || integrityChecking}><Trash2 size={16}/></button></div></div>
             </article>
           ))}</div>
         )}
