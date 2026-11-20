@@ -1,5 +1,9 @@
 import { Readable } from 'node:stream';
 import { createHash } from 'node:crypto';
+import {
+  googleConfigReady, requireUser, getGoogleAccount, getGoogleAccessToken,
+  decryptRefreshToken, googleApi, startGoogleOAuth, listGoogleFiles,
+} from '../lib/google-drive.js';
 
 async function hashReadableStream(stream) {
   const hash = createHash('sha256');
@@ -10,10 +14,6 @@ async function hashReadableStream(stream) {
   }
   return { sha256: hash.digest('hex'), size };
 }
-import {
-  googleConfigReady, requireUser, getGoogleAccount, getGoogleAccessToken,
-  decryptRefreshToken, googleApi, startGoogleOAuth, listGoogleFiles,
-} from '../lib/google-drive.js';
 
 function send(res, status, body) {
   res.status(status).json(body);
