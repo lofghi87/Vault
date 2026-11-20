@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { createClient } from '@supabase/supabase-js';
-import { LockKeyhole, ShieldCheck, ShieldAlert, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings, RefreshCw } from 'lucide-react';
+import { LockKeyhole, ShieldCheck, ShieldAlert, UploadCloud, Film, Share2, Trash2, LogOut, Eye, EyeOff, Copy, Check, X, Play, Clock3, HardDrive, LoaderCircle, KeyRound, Mail, ArrowUpRight, ArrowLeft, AlertCircle, Pencil, Maximize2, Download, UserRound, Activity, Smartphone, Settings, RefreshCw } from 'lucide-react';
 import './styles.css';
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
@@ -97,20 +97,30 @@ async function googleDownload(session, accountId, fileId, size) {
 }
 
 async function googleUpload(session, accountId, name, encryptedBlob) {
-  const started = await googleRequest(session, {
-    action: 'startUpload', accountId, name, size: encryptedBlob.size,
-  });
+  let started;
+  try {
+    started = await googleRequest(session, {
+      action: 'startUpload', accountId, name, size: encryptedBlob.size,
+    });
+  } catch (error) {
+    throw new Error('Avvio della sessione Google Drive non riuscito: ' + (error?.message || 'errore di rete'));
+  }
   if (!started.uploadUrl) throw new Error('Google Drive non ha preparato il caricamento.');
-  const chunkSize = 8 * 1024 * 1024; // Multiplo di 256 KB, adatto ai video di grandi dimensioni.
+  const chunkSize = 4 * 1024 * 1024; // Multiplo di 256 KB; blocchi più piccoli sono più gestibili su Safari/iOS.
   let offset = 0;
   let uploaded = null;
 
   const probeUpload = async () => {
-    const response = await fetch(started.uploadUrl, {
-      method: 'PUT',
-      headers: { 'Content-Range': 'bytes */' + encryptedBlob.size },
-      body: new Blob([]),
-    });
+    let response;
+    try {
+      response = await fetch(started.uploadUrl, {
+        method: 'PUT',
+        headers: { 'Content-Range': 'bytes */' + encryptedBlob.size },
+        body: new Blob([]),
+      });
+    } catch (error) {
+      throw new Error('Controllo dello stato della sessione Google Drive non riuscito: ' + (error?.message || 'errore di rete'));
+    }
     if (response.status === 200 || response.status === 201) {
       return { nextOffset: encryptedBlob.size, uploaded: await response.json().catch(() => ({})) };
     }
@@ -135,8 +145,18 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
         },
         body: chunk,
       });
-    } catch {
-      const progress = await probeUpload();
+    } catch (networkError) {
+      let progress;
+      try {
+        progress = await probeUpload();
+      } catch (probeError) {
+        throw new Error(
+          'Connessione durante il trasferimento verso Google Drive non riuscita: ' +
+          (networkError?.message || 'errore di rete') +
+          '. Anche il controllo del caricamento è fallito: ' +
+          (probeError?.message || 'errore di verifica')
+        );
+      }
       if (progress.uploaded) {
         uploaded = progress.uploaded;
         offset = encryptedBlob.size;
@@ -187,9 +207,14 @@ async function googleUpload(session, accountId, name, encryptedBlob) {
   }
   if (!uploaded?.id) throw new Error('Google Drive non ha confermato il completamento del caricamento.');
 
-  const verified = await googleRequest(session, {
-    action: 'verify', accountId, fileId: uploaded.id, expectedSize: encryptedBlob.size,
-  });
+  let verified;
+  try {
+    verified = await googleRequest(session, {
+      action: 'verify', accountId, fileId: uploaded.id, expectedSize: encryptedBlob.size,
+    });
+  } catch (error) {
+    throw new Error('Google Drive ha ricevuto il video, ma Vault non è riuscito a verificarlo tramite il server: ' + (error?.message || 'errore di rete'));
+  }
   return verified.data;
 }
 
@@ -348,9 +373,36 @@ async function deriveVaultKey(passphrase, userId) {
   return crypto.subtle.deriveKey({ name: 'PBKDF2', salt: new TextEncoder().encode('VAULT-v1:' + userId), iterations: 310000, hash: 'SHA-256' }, material, { name: 'AES-GCM', length: 256 }, true, ['encrypt', 'decrypt']);
 }
 
+async function readSelectedFile(file) {
+  try {
+    return await file.arrayBuffer();
+  } catch (arrayBufferError) {
+    // Safari su iOS può fallire nella lettura diretta di alcuni file selezionati da Foto/File.
+    // FileReader usa il percorso di lettura tradizionale del browser come fallback.
+    try {
+      return await new Promise((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => {
+          if (reader.result instanceof ArrayBuffer) resolve(reader.result);
+          else reject(new Error('Il dispositivo non ha restituito i dati del video.'));
+        };
+        reader.onerror = () => reject(reader.error || new Error('Lettura del file non riuscita.'));
+        reader.onabort = () => reject(new Error('Lettura del file interrotta.'));
+        reader.readAsArrayBuffer(file);
+      });
+    } catch (fileReaderError) {
+      throw new Error(
+        'Il dispositivo non riesce a leggere il file selezionato. ArrayBuffer: ' +
+        (arrayBufferError?.message || 'errore di lettura') +
+        '; FileReader: ' + (fileReaderError?.message || 'errore di lettura')
+      );
+    }
+  }
+}
+
 async function encryptVideo(file, key) {
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const plain = await file.arrayBuffer();
+  const plain = await readSelectedFile(file);
   const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plain);
   return new Blob([new Uint8Array([86, 76, 84, 49]), iv, cipher], { type: 'application/octet-stream' });
 }
@@ -476,6 +528,7 @@ function App() {
   const [loadedVaultKey, setLoadedVaultKey] = useState(null);
   const [trashOpen, setTrashOpen] = useState(false);
   const [trashActionId, setTrashActionId] = useState('');
+  const [trashBulkProgress, setTrashBulkProgress] = useState('');
   const [integrityChecking, setIntegrityChecking] = useState(false);
   const [integrityProgress, setIntegrityProgress] = useState('');
   const [integrityResults, setIntegrityResults] = useState([]);
@@ -1231,6 +1284,7 @@ function App() {
     const uploadedDriveItems = [];
     const failures = [];
     const metadataWarnings = [];
+    const recoveryWarnings = [];
     let completed = 0;
     let nextIndex = 0;
     // I video vengono letti interamente in memoria durante la cifratura. Su iPhone/iPad, due video grandi in parallelo possono saturare la memoria e interrompere gli altri caricamenti su Drive.
@@ -1240,8 +1294,13 @@ function App() {
     async function uploadOne(file, index) {
       const storedName = crypto.randomUUID() + '.vlt';
       const path = session.user.id + '/Vault/' + storedName;
+      let encrypted = null;
       try {
-        const encrypted = await encryptVideo(file, vaultKey);
+        try {
+          encrypted = await encryptVideo(file, vaultKey);
+        } catch (readError) {
+          throw new Error('Lettura e cifratura sul dispositivo: ' + (readError?.message || 'errore durante la lettura del video'));
+        }
         if (isGoogleDestination) {
           const saved = await googleUpload(session, googleAccountId, storedName, encrypted);
           const drivePath = 'google:' + googleAccountId + ':' + saved.id;
@@ -1281,7 +1340,59 @@ function App() {
           await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato sul dispositivo e salvato su Backblaze B2');
         }
       } catch (uploadError) {
-        failures.push(file.name + ': ' + (uploadError.message || 'errore sconosciuto'));
+        let recoveredFromDrive = false;
+        let recoveryError = null;
+
+        // Se la connessione si interrompe dopo che Drive ha ricevuto tutti i byte,
+        // la risposta del browser può andare persa. Cerchiamo il nome UUID univoco
+        // nella cartella Vault prima di dichiarare il file non caricato.
+        if (isGoogleDestination && encrypted) {
+          try {
+            const listed = await googleRequest(session, { action: 'list', accountId: googleAccountId });
+            const matchingFile = (listed.data || []).find(file =>
+              file.name === storedName &&
+              (!Number(file.size || 0) || Number(file.size) === encrypted.size)
+            );
+            if (matchingFile) {
+              const drivePath = 'google:' + googleAccountId + ':' + matchingFile.id;
+              uploadedDriveItems.push({
+                id: 'google-' + googleAccountId + '-' + matchingFile.id,
+                fileId: matchingFile.id,
+                accountId: googleAccountId,
+                accountEmail: googleAccount.email,
+                path: drivePath,
+                name: matchingFile.name || storedName,
+                displayName: file.name || getDisplayName(matchingFile.name || storedName),
+                size: Number(matchingFile.size || encrypted.size),
+                created_at: matchingFile.created_at || new Date().toISOString(),
+                mime: file.type || getOriginalVideoMime(file.name),
+                encrypted: true,
+                provider: 'google',
+                providerLabel: 'Google Drive · ' + googleAccount.email,
+              });
+              try {
+                await saveEncryptedVideoMetadata(session.user.id, metadataStoragePath(session.user.id, drivePath), {
+                  name: file.name,
+                  mime: file.type || getOriginalVideoMime(file.name),
+                }, vaultKey);
+              } catch (metadataError) {
+                metadataWarnings.push(file.name + ': ' + (metadataError.message || 'metadati non sincronizzati'));
+              }
+              await logActivity(session.user.id, 'video_uploaded', null, 'Video cifrato salvato su Google Drive e recuperato dopo una risposta di rete interrotta · ' + googleAccount.email);
+              recoveryWarnings.push(file.name + ': Google Drive aveva già salvato il video; Vault ha recuperato la conferma.');
+              recoveredFromDrive = true;
+            }
+          } catch (reconcileError) {
+            recoveryError = reconcileError?.message || 'non è stato possibile verificare la cartella Drive';
+          }
+        }
+
+        if (!recoveredFromDrive) {
+          failures.push(
+            file.name + ': ' + (uploadError.message || 'errore sconosciuto') +
+            (recoveryError ? ' · verifica su Drive non riuscita: ' + recoveryError : '')
+          );
+        }
       } finally {
         completed++;
         setProgressName(completed + ' di ' + selected.length + ' completati · ' + file.name);
@@ -1314,14 +1425,15 @@ function App() {
     }
 
     const successfulUploads = selected.length - failures.length;
+    const warnings = [...recoveryWarnings, ...metadataWarnings];
     if (failures.length) {
-      setError('Caricamento terminato: ' + successfulUploads + ' di ' + selected.length + ' video caricati. Errori reali di caricamento: ' + failures.slice(0, 3).join(' · '));
+      setError('Caricamento terminato: ' + successfulUploads + ' di ' + selected.length + ' video salvati. Dettagli: ' + failures.slice(0, 3).join(' · '));
     } else {
       const successText = selected.length === 1
         ? 'Video caricato e cifrato correttamente.'
         : 'Tutti e ' + selected.length + ' video sono stati caricati e cifrati correttamente.';
-      setMessage(metadataWarnings.length
-        ? successText + ' Attenzione: alcuni nomi o dettagli non sono stati sincronizzati: ' + metadataWarnings.slice(0, 3).join(' · ')
+      setMessage(warnings.length
+        ? successText + ' Avvisi: ' + warnings.slice(0, 3).join(' · ')
         : successText);
     }
   }
@@ -1724,6 +1836,122 @@ function App() {
       setError('Non sono riuscito a eliminare definitivamente il video: ' + (deleteError.message || 'errore sconosciuto'));
     } finally {
       setTrashActionId('');
+    }
+  }
+
+  async function restoreAllTrashedVideos() {
+    const targets = [...trashedVideos];
+    if (!targets.length || trashActionId || integrityChecking) return;
+    if (!window.confirm('Recuperare tutti e ' + targets.length + ' video dal cestino e riportarli nella galleria? I file resteranno nello spazio cloud.')) return;
+
+    setTrashActionId('bulk-restore');
+    setTrashBulkProgress('');
+    setError('');
+    setMessage('');
+    const failures = [];
+    try {
+      for (let index = 0; index < targets.length; index++) {
+        const item = targets[index];
+        setTrashBulkProgress('Recupero ' + (index + 1) + ' di ' + targets.length + ' · ' + (item.displayName || getDisplayName(item.name)));
+        try {
+          await updateEncryptedVideoMetadata(
+            session.user.id,
+            metadataStoragePath(session.user.id, item.path),
+            vaultKey,
+            {
+              name: item.displayName || getDisplayName(item.name),
+              mime: item.mime || getOriginalVideoMime(item.name),
+              trashedAt: item.trashedAt,
+            },
+            currentMetadata => {
+              const { trashedAt, ...restoredMetadata } = currentMetadata;
+              return restoredMetadata;
+            }
+          );
+        } catch (restoreError) {
+          failures.push((item.displayName || getDisplayName(item.name)) + ': ' + (restoreError.message || 'errore sconosciuto'));
+        }
+      }
+      await loadVideos();
+      if (failures.length) {
+        setError('Recuperati ' + (targets.length - failures.length) + ' di ' + targets.length + ' video. Problemi: ' + failures.slice(0, 3).join(' · '));
+      } else {
+        setMessage('Tutti e ' + targets.length + ' video sono stati recuperati nella galleria.');
+      }
+    } finally {
+      setTrashActionId('');
+      setTrashBulkProgress('');
+    }
+  }
+
+  async function emptyTrash() {
+    const targets = [...trashedVideos];
+    if (!targets.length || trashActionId || integrityChecking) return;
+    if (!window.confirm(
+      'SVUOTARE IL CESTINO? Verranno eliminati definitivamente tutti e ' + targets.length +
+      ' video dai rispettivi archivi cloud. L’operazione non può essere annullata e i video non saranno più recuperabili.'
+    )) return;
+
+    setTrashActionId('bulk-empty');
+    setTrashBulkProgress('');
+    setError('');
+    setMessage('');
+    const failures = [];
+    const warnings = [];
+    let deleted = 0;
+
+    try {
+      for (let index = 0; index < targets.length; index++) {
+        const item = targets[index];
+        setTrashBulkProgress('Eliminazione ' + (index + 1) + ' di ' + targets.length + ' · ' + (item.displayName || getDisplayName(item.name)));
+        try {
+          const { data: linkedShares, error: sharesError } = await supabase
+            .from('vault_shares')
+            .select('id,storage_path')
+            .eq('user_id', session.user.id)
+            .eq('original_path', item.path)
+            .is('revoked_at', null);
+          if (sharesError) throw new Error('Non riesco a verificare i link collegati: ' + sharesError.message);
+          if (linkedShares?.length) {
+            await b2DeleteShareCopies(session, linkedShares.map(row => row.storage_path));
+            const { error: markSharesError } = await supabase
+              .from('vault_shares')
+              .update({ revoked_at: new Date().toISOString() })
+              .in('id', linkedShares.map(row => row.id));
+            if (markSharesError) throw new Error('Non riesco ad aggiornare il registro dei link: ' + markSharesError.message);
+          }
+
+          if (item.provider === 'google') {
+            await googleRequest(session, { action: 'delete', accountId: item.accountId, fileId: item.fileId });
+          } else {
+            await b2Delete(session, [item.path]);
+          }
+
+          const { error: metadataDeleteError } = await supabase
+            .from('vault_video_meta')
+            .delete()
+            .eq('user_id', session.user.id)
+            .eq('storage_path', metadataStoragePath(session.user.id, item.path));
+          if (metadataDeleteError) {
+            warnings.push((item.displayName || getDisplayName(item.name)) + ': file eliminato, ma metadati residui da ripulire');
+            console.warn('File eliminato ma metadati da ripulire:', metadataDeleteError.message);
+          }
+          await logActivity(session.user.id, 'video_deleted', null, 'Video eliminato definitivamente durante lo svuotamento del cestino.');
+          deleted++;
+        } catch (deleteError) {
+          failures.push((item.displayName || getDisplayName(item.name)) + ': ' + (deleteError.message || 'errore sconosciuto'));
+        }
+      }
+
+      await Promise.all([loadVideos(), loadSecurityData()]);
+      if (failures.length) {
+        setError('Eliminati definitivamente ' + deleted + ' di ' + targets.length + ' video. Problemi: ' + failures.slice(0, 3).join(' · '));
+      } else {
+        setMessage('Cestino svuotato: ' + deleted + ' video eliminati definitivamente.' + (warnings.length ? ' Avvisi: ' + warnings.slice(0, 2).join(' · ') : ''));
+      }
+    } finally {
+      setTrashActionId('');
+      setTrashBulkProgress('');
     }
   }
 
@@ -2337,7 +2565,7 @@ function App() {
       <footer className="dash-footer"><span><ShieldCheck size={14}/> I video sono cifrati sul dispositivo prima del salvataggio nella destinazione scelta.</span><span>VAULT · CLIENT-SIDE ENCRYPTION</span></footer>
       {message && <div className="notice success dashboard-notice"><Check size={16}/>{message}<button onClick={() => setMessage('')}><X size={15}/></button></div>}
       {settingsHubOpen && <div className="modal-backdrop" onClick={() => setSettingsHubOpen(false)}><div className="share-modal settings-hub-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSettingsHubOpen(false)}><X size={18}/></button><div className="modal-icon"><Settings size={21}/></div><div className="section-kicker">CENTRO DI CONTROLLO</div><h2>Impostazioni</h2><p>Tutte le opzioni di Vault raccolte in un unico posto.</p><div className="settings-menu-list"><button className="settings-menu-item" type="button" onClick={() => {setSettingsHubOpen(false);setStorageOpen(true);}}><span className="settings-menu-icon"><HardDrive size={18}/></span><span><b>Archiviazione</b><small>Destinazione dei video e account Google collegati</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setAccountName(session.user.user_metadata?.display_name || '');setAccountEmail(session.user.email || '');setError('');setMessage('');setSettingsHubOpen(false);setAccountOpen(true);}}><span className="settings-menu-icon"><UserRound size={18}/></span><span><b>Account</b><small>Profilo, email e password</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {setError('');setMessage('');setSettingsHubOpen(false);setSecurityOpen(true);loadSecurityData();}}><span className="settings-menu-icon"><ShieldCheck size={18}/></span><span><b>Sicurezza e privacy</b><small>Sessioni, notifiche, link e attività</small></span><ArrowUpRight size={16}/></button><button className="settings-menu-item" type="button" onClick={() => {if (integrityChecking) {setMessage('Attendi il termine del controllo di integrità.'); return;} setError('');setMessage('');setSettingsHubOpen(false);setSettingsOpen(true);}}><span className="settings-menu-icon"><KeyRound size={18}/></span><span><b>Frase segreta Vault</b><small>Modifica la frase e ricifra l'archivio</small></span><ArrowUpRight size={16}/></button></div></div></div>}
-      {storageOpen && <div className="modal-backdrop" onClick={() => !googleConnectBusy && !uploading && setStorageOpen(false)}><div className="share-modal settings-detail-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !googleConnectBusy && !uploading && setStorageOpen(false)}><X size={18}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI ARCHIVIAZIONE</div><h2>Destinazione dei video</h2><p>Scegli dove salvare i prossimi video e gestisci gli account collegati.</p>
+      {storageOpen && <div className="modal-backdrop" onClick={() => {if (!googleConnectBusy && !uploading) {setStorageOpen(false);setSettingsHubOpen(true);}}}><div className="share-modal settings-detail-modal" onClick={e => e.stopPropagation()}><button className="modal-back-btn" type="button" aria-label="Torna alle impostazioni" title="Torna alle impostazioni" disabled={googleConnectBusy || uploading} onClick={() => {setStorageOpen(false);setSettingsHubOpen(true);}}><ArrowLeft size={19}/></button><div className="modal-icon"><HardDrive size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI ARCHIVIAZIONE</div><h2>Destinazione dei video</h2><p>Scegli dove salvare i prossimi video e gestisci gli account collegati.</p>
       <section className="storage-panel">
         <div className="storage-panel-head">
           <div>
@@ -2382,10 +2610,10 @@ function App() {
         <p className="storage-note">Puoi collegare un solo account Google alla volta. Per cambiarlo, scollega quello attuale e collega il nuovo. I video già presenti nel Drive non vengono eliminati.</p>
       </section>
       </div></div>}
-      {accountOpen && <div className="modal-backdrop" onClick={() => !accountBusy && setAccountOpen(false)}><div className="share-modal account-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => !accountBusy && setAccountOpen(false)}><X size={18}/></button><div className="modal-icon"><UserRound size={21}/></div><div className="section-kicker">IL TUO ACCOUNT</div><h2>Profilo e credenziali</h2><p>Gestisci i dati dell’account. La frase segreta Vault resta separata dalla password.</p><div className="account-field"><label>Email attuale</label><div className="account-current">{session.user.email}</div></div><label>Nome visualizzato</label><div className="input-wrap"><UserRound size={17}/><input value={accountName} onChange={e => setAccountName(e.target.value)} maxLength={60} placeholder="Nome profilo"/></div><button className="primary-btn copy-btn" type="button" disabled={accountBusy} onClick={saveAccountName}>{accountBusy ? <LoaderCircle className="spin" size={16}/> : <Check size={16}/>} Salva nome</button><div className="account-divider"/><label>Nuovo indirizzo email</label><div className="input-wrap"><Mail size={17}/><input type="email" value={accountEmail} onChange={e => setAccountEmail(e.target.value)} autoComplete="email" placeholder="nuova@email.com"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy} onClick={requestAccountEmailChange}>Richiedi cambio email</button><p className="card-sub account-hint">Il cambio potrebbe richiedere la conferma tramite email.</p><div className="account-divider"/><label>Password attuale</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={currentAccountPassword} onChange={e => setCurrentAccountPassword(e.target.value)} autoComplete="current-password" placeholder="Password attuale"/></div><label>Nuova password</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={newAccountPassword} onChange={e => setNewAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Almeno 8 caratteri"/></div><label>Conferma nuova password</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={confirmAccountPassword} onChange={e => setConfirmAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Ripeti la nuova password"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy || !currentAccountPassword || newAccountPassword.length < 8 || !confirmAccountPassword} onClick={updateAccountPassword}>Aggiorna password</button>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}</div></div>}
-      {securityOpen && <div className="modal-backdrop" onClick={() => setSecurityOpen(false)}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-close" type="button" onClick={() => setSecurityOpen(false)}><X size={18}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:(entry.details || '').includes('cestino') ? ((entry.details || '').includes('definitivamente') ? 'Video eliminato definitivamente' : 'Video spostato nel cestino') : 'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
-      {settingsOpen && <div className="modal-backdrop" onClick={() => !rotationBusy && setSettingsOpen(false)}><div className="share-modal settings-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={rotationBusy} onClick={() => setSettingsOpen(false)}><X size={18}/></button><div className="modal-icon"><KeyRound size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI SICUREZZA</div><h2>Modifica frase segreta</h2><p>Vault ricifrerà tutti i video con la nuova frase. Le frasi vengono elaborate solo sul dispositivo e non vengono inviate ai server.</p><div className="security-option" style={{marginBottom:20,padding:16,border:'1px solid var(--border)',borderRadius:14}}><div className="section-kicker">PRIVACY DEI FILE</div><h3 style={{margin:'6px 0'}}>Proteggi i nomi dei video esistenti</h3><p style={{margin:'0 0 12px'}}>Sostituisce i vecchi nomi visibili negli archivi con nomi casuali. I nomi originali restano disponibili in Vault, salvati in metadati cifrati.</p><button className="primary-btn" type="button" disabled={metadataMigrationBusy || rotationBusy || !vaultKey || !videos.length} onClick={protectExistingVideoNames}>{metadataMigrationBusy ? 'Protezione in corso…' : 'Proteggi i video esistenti'}</button>{metadataMigrationProgress && <p role="status" style={{margin:'10px 0 0'}}>{metadataMigrationProgress}</p>}</div><form onSubmit={changeVaultPassphrase}><label>Frase segreta attuale</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={currentVaultPassphrase} onChange={e => setCurrentVaultPassphrase(e.target.value)} autoComplete="current-password" required placeholder="Inserisci la frase attuale"/></div><label>Nuova frase segreta</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphrase ? 'text' : 'password'} value={newVaultPassphrase} onChange={e => setNewVaultPassphrase(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Almeno 12 caratteri"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphrase(v => !v)} aria-label="Mostra nuova frase">{showNewVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><label>Conferma nuova frase</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphraseConfirm ? 'text' : 'password'} value={newVaultPassphraseConfirm} onChange={e => setNewVaultPassphraseConfirm(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Ripeti la nuova frase"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphraseConfirm(v => !v)} aria-label="Mostra conferma nuova frase">{showNewVaultPassphraseConfirm ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><p className="card-sub settings-warning">Non chiudere la pagina durante la procedura. Gli originali vengono eliminati solo dopo la verifica di tutte le nuove copie.</p><button className="primary-btn copy-btn" disabled={rotationBusy}>{rotationBusy ? <><LoaderCircle className="spin" size={17}/> Aggiornamento in corso…</> : <><ShieldCheck size={17}/> Ricifra e aggiorna la frase</>}</button></form>{rotationProgress && <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/>{rotationProgress}</div>}</div></div>}
-      {trashOpen && <div className="modal-backdrop" onClick={() => !trashActionId && setTrashOpen(false)}><div className="share-modal trash-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={Boolean(trashActionId)} onClick={() => setTrashOpen(false)}><X size={18}/></button><div className="modal-icon"><Trash2 size={21}/></div><div className="section-kicker">RECUPERO DEI CONTENUTI</div><h2>Cestino</h2><p>I video qui restano nel provider cloud e continuano a occupare spazio. Non vengono eliminati automaticamente: puoi ripristinarli oppure eliminarli definitivamente quando decidi tu.</p>{trashedVideos.length === 0 ? <div className="security-empty">Il cestino è vuoto.</div> : <div className="trash-list">{trashedVideos.map(item => <div className="trash-row" key={item.id}><div className="trash-row-copy"><b>{item.displayName || getDisplayName(item.name)}</b><span>{item.providerLabel} · {formatSize(item.size)} · nel cestino dal {new Date(item.trashedAt).toLocaleDateString('it-IT')}</span></div><div className="trash-row-actions"><button type="button" className="trash-restore-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={() => restoreVideo(item)}>{trashActionId === item.id ? <LoaderCircle className="spin" size={14}/> : <RefreshCw size={14}/>} Ripristina</button><button type="button" className="trash-permanent-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={() => permanentlyDeleteVideo(item)}><Trash2 size={14}/> Elimina</button></div></div>)}</div>}</div></div>}
+      {accountOpen && <div className="modal-backdrop" onClick={() => {if (!accountBusy) {setAccountOpen(false);setSettingsHubOpen(true);}}}><div className="share-modal account-modal" onClick={e => e.stopPropagation()}><button className="modal-back-btn" type="button" aria-label="Torna alle impostazioni" title="Torna alle impostazioni" disabled={accountBusy} onClick={() => {setAccountOpen(false);setSettingsHubOpen(true);}}><ArrowLeft size={19}/></button><div className="modal-icon"><UserRound size={21}/></div><div className="section-kicker">IL TUO ACCOUNT</div><h2>Profilo e credenziali</h2><p>Gestisci i dati dell’account. La frase segreta Vault resta separata dalla password.</p><div className="account-field"><label>Email attuale</label><div className="account-current">{session.user.email}</div></div><label>Nome visualizzato</label><div className="input-wrap"><UserRound size={17}/><input value={accountName} onChange={e => setAccountName(e.target.value)} maxLength={60} placeholder="Nome profilo"/></div><button className="primary-btn copy-btn" type="button" disabled={accountBusy} onClick={saveAccountName}>{accountBusy ? <LoaderCircle className="spin" size={16}/> : <Check size={16}/>} Salva nome</button><div className="account-divider"/><label>Nuovo indirizzo email</label><div className="input-wrap"><Mail size={17}/><input type="email" value={accountEmail} onChange={e => setAccountEmail(e.target.value)} autoComplete="email" placeholder="nuova@email.com"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy} onClick={requestAccountEmailChange}>Richiedi cambio email</button><p className="card-sub account-hint">Il cambio potrebbe richiedere la conferma tramite email.</p><div className="account-divider"/><label>Password attuale</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={currentAccountPassword} onChange={e => setCurrentAccountPassword(e.target.value)} autoComplete="current-password" placeholder="Password attuale"/></div><label>Nuova password</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={newAccountPassword} onChange={e => setNewAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Almeno 8 caratteri"/></div><label>Conferma nuova password</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={confirmAccountPassword} onChange={e => setConfirmAccountPassword(e.target.value)} minLength={8} autoComplete="new-password" placeholder="Ripeti la nuova password"/></div><button className="secondary-share-btn" type="button" disabled={accountBusy || !currentAccountPassword || newAccountPassword.length < 8 || !confirmAccountPassword} onClick={updateAccountPassword}>Aggiorna password</button>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}</div></div>}
+      {securityOpen && <div className="modal-backdrop" onClick={() => {setSecurityOpen(false);setSettingsHubOpen(true);}}><div className="share-modal security-modal" onClick={e => e.stopPropagation()}><button className="modal-back-btn" type="button" aria-label="Torna alle impostazioni" title="Torna alle impostazioni" onClick={() => {setSecurityOpen(false);setSettingsHubOpen(true);}}><ArrowLeft size={19}/></button><div className="modal-icon"><ShieldCheck size={21}/></div><div className="section-kicker">CONTROLLO E PROTEZIONE</div><h2>Centro sicurezza</h2><p>Gestisci i link temporanei e controlla le attività recenti del tuo account.</p><button className="secondary-share-btn" type="button" onClick={enableBrowserNotifications} disabled={notificationsEnabled}>{notificationsEnabled ? <><Check size={16}/> Notifiche locali attive</> : 'Attiva notifiche su questo dispositivo'}</button><p className="account-hint">Notifiche del browser solo mentre Vault è aperto; non sono avvisi push quando il sito è chiuso.</p><div className="security-device"><Smartphone size={18}/><div><b>Sessione corrente</b><span>{getDeviceLabel()}</span></div><span className="current-device-pill">ATTIVA</span></div><div className="security-section-head"><h3>Sessioni riconosciute</h3><span className="account-hint">Dagli accessi recenti</span></div><div className="security-list">{activity.filter(entry => entry.event_type === 'login').slice(0,5).map(entry => <div className="security-row" key={entry.id}><div className="security-row-main"><b>{entry.details || 'Accesso registrato'}</b><span>{new Date(entry.created_at).toLocaleString('it-IT')}</span></div></div>)}</div><p className="account-hint">Questa è la cronologia degli accessi registrati da Vault, non l’elenco live delle sessioni aperte.</p><button className="secondary-share-btn" type="button" onClick={signOutOtherSessions}>Disconnetti gli altri dispositivi</button><p className="account-hint">Supabase consente di revocare le altre sessioni, ma non fornisce a questa app l’elenco dettagliato dei dispositivi. I token di accesso già emessi possono restare validi fino alla scadenza.</p><div className="account-divider"/><div className="security-section-head"><h3>Avvisi</h3><span className="account-hint">{securityAlerts.length} da controllare</span></div>{securityAlerts.length ? <div className="security-list">{securityAlerts.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); return <div className="security-row" key={'alert-'+share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{expired ? 'Link scaduto: la copia sarà rimossa' : 'Link in scadenza entro 15 minuti'}</span></div><span className="current-device-pill">{expired ? 'SCADUTO' : 'IN SCADENZA'}</span></div>; })}</div> : <div className="security-empty">Nessun link in scadenza nei prossimi 15 minuti.</div>}<div className="account-divider"/><div className="security-section-head"><h3>Link temporanei</h3><button className="text-btn" type="button" onClick={loadSecurityData}>Aggiorna</button></div>{error && <div className="notice error"><AlertCircle size={16}/>{error}</div>}{message && <div className="notice success"><Check size={16}/>{message}</div>}{securityLoading ? <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/> Caricamento…</div> : shares.length === 0 ? <div className="security-empty">Non hai ancora creato link temporanei.</div> : <div className="security-list">{shares.map(share => { const expired = new Date(share.expires_at).getTime() <= Date.now(); const revoked = Boolean(share.revoked_at); return <div className="security-row" key={share.id}><div className="security-row-main"><b>{share.file_name}</b><span>{revoked ? (expired ? 'Scaduto e ripulito' : 'Revocato') : expired ? 'Scaduto' : 'Attivo'} · scade {new Date(share.expires_at).toLocaleString('it-IT')}</span></div>{!revoked && <button className="revoke-btn" type="button" onClick={() => revokeShare(share)}>{expired ? 'Pulisci' : 'Revoca'}</button>}</div>; })}</div>}<div className="account-divider"/><div className="security-section-head"><h3>Attività recenti</h3><span className="account-hint">Ultime 40 azioni</span></div><p className="account-hint">Registro applicativo: annota le operazioni eseguite da Vault, ma non è un registro forense indipendente o non modificabile.</p>{activity.length === 0 ? <div className="security-empty">Le attività appariranno qui.</div> : <div className="security-list activity-list">{activity.map(entry => <div className="activity-row" key={entry.id}><div><b>{{login:'Accesso',video_uploaded:'Video caricato',video_opened:'Video aperto',video_renamed:'Video rinominato',video_deleted:(entry.details || '').includes('cestino') ? ((entry.details || '').includes('definitivamente') ? 'Video eliminato definitivamente' : 'Video spostato nel cestino') : 'Video eliminato',share_created:'Link creato',share_revoked:'Link revocato',password_changed:'Password aggiornata',email_change_requested:'Cambio email richiesto',other_sessions_signed_out:'Altre sessioni revocate',vault_unlocked:'Cassaforte sbloccata'}[entry.event_type] || 'Attività'}</b><span>{entry.item_name || entry.details || '—'}</span></div><time>{new Date(entry.created_at).toLocaleString('it-IT')}</time></div>)}</div>}</div></div>}
+      {settingsOpen && <div className="modal-backdrop" onClick={() => {if (!rotationBusy) {setSettingsOpen(false);setSettingsHubOpen(true);}}}><div className="share-modal settings-modal" onClick={e => e.stopPropagation()}><button className="modal-back-btn" type="button" aria-label="Torna alle impostazioni" title="Torna alle impostazioni" disabled={rotationBusy} onClick={() => {setSettingsOpen(false);setSettingsHubOpen(true);}}><ArrowLeft size={19}/></button><div className="modal-icon"><KeyRound size={21}/></div><div className="section-kicker">IMPOSTAZIONI DI SICUREZZA</div><h2>Modifica frase segreta</h2><p>Vault ricifrerà tutti i video con la nuova frase. Le frasi vengono elaborate solo sul dispositivo e non vengono inviate ai server.</p><div className="security-option" style={{marginBottom:20,padding:16,border:'1px solid var(--border)',borderRadius:14}}><div className="section-kicker">PRIVACY DEI FILE</div><h3 style={{margin:'6px 0'}}>Proteggi i nomi dei video esistenti</h3><p style={{margin:'0 0 12px'}}>Sostituisce i vecchi nomi visibili negli archivi con nomi casuali. I nomi originali restano disponibili in Vault, salvati in metadati cifrati.</p><button className="primary-btn" type="button" disabled={metadataMigrationBusy || rotationBusy || !vaultKey || !videos.length} onClick={protectExistingVideoNames}>{metadataMigrationBusy ? 'Protezione in corso…' : 'Proteggi i video esistenti'}</button>{metadataMigrationProgress && <p role="status" style={{margin:'10px 0 0'}}>{metadataMigrationProgress}</p>}</div><form onSubmit={changeVaultPassphrase}><label>Frase segreta attuale</label><div className="input-wrap"><KeyRound size={17}/><input type="password" value={currentVaultPassphrase} onChange={e => setCurrentVaultPassphrase(e.target.value)} autoComplete="current-password" required placeholder="Inserisci la frase attuale"/></div><label>Nuova frase segreta</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphrase ? 'text' : 'password'} value={newVaultPassphrase} onChange={e => setNewVaultPassphrase(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Almeno 12 caratteri"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphrase(v => !v)} aria-label="Mostra nuova frase">{showNewVaultPassphrase ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><label>Conferma nuova frase</label><div className="input-wrap"><KeyRound size={17}/><input type={showNewVaultPassphraseConfirm ? 'text' : 'password'} value={newVaultPassphraseConfirm} onChange={e => setNewVaultPassphraseConfirm(e.target.value)} minLength={12} autoComplete="new-password" required placeholder="Ripeti la nuova frase"/><button className="eye-btn" type="button" onClick={() => setShowNewVaultPassphraseConfirm(v => !v)} aria-label="Mostra conferma nuova frase">{showNewVaultPassphraseConfirm ? <EyeOff size={17}/> : <Eye size={17}/>}</button></div><p className="card-sub settings-warning">Non chiudere la pagina durante la procedura. Gli originali vengono eliminati solo dopo la verifica di tutte le nuove copie.</p><button className="primary-btn copy-btn" disabled={rotationBusy}>{rotationBusy ? <><LoaderCircle className="spin" size={17}/> Aggiornamento in corso…</> : <><ShieldCheck size={17}/> Ricifra e aggiorna la frase</>}</button></form>{rotationProgress && <div className="incoming-share-status"><LoaderCircle className="spin" size={17}/>{rotationProgress}</div>}</div></div>}
+      {trashOpen && <div className="modal-backdrop" onClick={() => !trashActionId && setTrashOpen(false)}><div className="share-modal trash-modal" onClick={e => e.stopPropagation()}><button className="modal-close" disabled={Boolean(trashActionId)} onClick={() => setTrashOpen(false)}><X size={18}/></button><div className="modal-icon"><Trash2 size={21}/></div><div className="section-kicker">RECUPERO DEI CONTENUTI</div><h2>Cestino</h2><p>I video qui restano nel provider cloud e continuano a occupare spazio. Non vengono eliminati automaticamente: puoi ripristinarli oppure eliminarli definitivamente quando decidi tu.</p>{trashedVideos.length === 0 ? <div className="security-empty">Il cestino è vuoto.</div> : <><div className="trash-bulk-actions"><button type="button" className="trash-restore-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={restoreAllTrashedVideos}>{trashActionId === 'bulk-restore' ? <LoaderCircle className="spin" size={14}/> : <RefreshCw size={14}/>} Recupera tutto</button><button type="button" className="trash-permanent-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={emptyTrash}>{trashActionId === 'bulk-empty' ? <LoaderCircle className="spin" size={14}/> : <Trash2 size={14}/>} Svuota cestino</button></div>{trashBulkProgress && <div className="incoming-share-status"><LoaderCircle className="spin" size={16}/>{trashBulkProgress}</div>}<div className="trash-list">{trashedVideos.map(item => <div className="trash-row" key={item.id}><div className="trash-row-copy"><b>{item.displayName || getDisplayName(item.name)}</b><span>{item.providerLabel} · {formatSize(item.size)} · nel cestino dal {new Date(item.trashedAt).toLocaleDateString('it-IT')}</span></div><div className="trash-row-actions"><button type="button" className="trash-restore-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={() => restoreVideo(item)}>{trashActionId === item.id ? <LoaderCircle className="spin" size={14}/> : <RefreshCw size={14}/>} Ripristina</button><button type="button" className="trash-permanent-btn" disabled={Boolean(trashActionId) || integrityChecking} onClick={() => permanentlyDeleteVideo(item)}><Trash2 size={14}/> Elimina</button></div></div>)}</div></>}</div></div>}
       {previewUrl && <div className="modal-backdrop" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><div className="share-modal video-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {URL.revokeObjectURL(previewUrl);setPreviewUrl('');setPreviewName('');}}><X size={18}/></button><div className="section-kicker">DECIFRATO SOLO IN MEMORIA</div><h2>{previewName}</h2><div className="video-player-wrap"><video ref={videoElementRef} src={previewUrl} controls autoPlay playsInline style={{width:'100%',maxHeight:'60vh',marginTop:16,background:'#000'}}/>{!isAppleVideoDevice() && <button className="fullscreen-btn" onClick={requestVideoFullscreen}><Maximize2 size={17}/> Schermo intero</button>}</div></div></div>}
       {renameItem && <div className="modal-backdrop" onClick={() => !renameBusy && setRenameItem(null)}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => !renameBusy && setRenameItem(null)}><X size={18}/></button><div className="modal-icon"><Pencil size={21}/></div><div className="section-kicker">MODIFICA VIDEO</div><h2>Rinomina video</h2><p>Modifica il nome con cui compare nella tua libreria. Il contenuto cifrato non viene modificato.</p><form onSubmit={saveRename}><input className="rename-input" value={renameValue} onChange={e => setRenameValue(e.target.value)} maxLength={100} autoFocus placeholder="Nome del video"/><button className="primary-btn copy-btn" disabled={renameBusy}>{renameBusy ? <LoaderCircle className="spin" size={17}/> : <Check size={17}/>} Salva nome</button></form></div></div>}
       {shareItem && <div className="modal-backdrop" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><div className="share-modal" onClick={e => e.stopPropagation()}><button className="modal-close" onClick={() => {setShareItem(null);setShareUrl('');setCopyFile(null);}}><X size={18}/></button><div className="modal-icon"><Share2 size={21}/></div><div className="section-kicker">CONDIVISIONE SICURA</div><h2>Condividi questo video</h2><p>Scegli se inviare un link temporaneo oppure una copia del file, che resterà sul dispositivo di chi la riceve.</p><div className="share-file"><Film size={17}/><span>{shareItem.displayName || getDisplayName(shareItem.name)}</span></div><button className="secondary-share-btn" disabled={shareBusy} onClick={createTemporaryLink}>{shareBusy && !copyFile ? <LoaderCircle className="spin" size={16}/> : <Clock3 size={16}/>} Crea link valido 1 ora</button>{shareUrl && <><div className="share-link">{shareUrl}</div><button className="primary-btn copy-btn" onClick={copyShare}>{copied ? <><Check size={17}/> Link copiato</> : <><Copy size={17}/> Copia link</>}</button></>}<div className="share-divider">OPPURE</div><button className="primary-btn copy-btn" disabled={shareBusy} onClick={copyFile ? sendPreparedCopy : prepareCopy}>{shareBusy ? <><LoaderCircle className="spin" size={17}/> Preparo la copia…</> : copyFile ? <><Share2 size={17}/> Invia la copia</> : <><Download size={17}/> Prepara una copia da inviare</>}</button><div className="expiry-note"><ShieldCheck size={14}/> La copia inviata non dipende da Vault e non scade. Il link invece dura 60 minuti.</div></div></div>}
