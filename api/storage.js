@@ -390,8 +390,20 @@ export default async function handler(req, res) {
       if (usage.totalBytes + requestedSize > GLOBAL_SAFE_LIMIT_BYTES) {
         return send(res, 507, { error: 'Lo spazio disponibile di Vault è temporaneamente esaurito. I tuoi video restano accessibili, ma per ora non è possibile caricarne altri.' });
       }
-      const command = new PutObjectCommand({ Bucket: bucket, Key: key, ContentType: 'application/octet-stream', CacheControl: 'no-store' });
-      const url = await getSignedUrl(s3, command, { expiresIn: 300 });
+      const command = new PutObjectCommand({
+        Bucket: bucket,
+        Key: key,
+        ContentLength: requestedSize,
+        ContentType: 'application/octet-stream',
+        CacheControl: 'no-store',
+      });
+      // Bind the declared object size into the SigV4 signature. The browser's
+      // fetch implementation supplies Content-Length from the Blob body; a
+      // different-sized body must not be accepted under this upload URL.
+      const url = await getSignedUrl(s3, command, {
+        expiresIn: 300,
+        signableHeaders: new Set(['content-length']),
+      });
       return send(res, 200, { url });
     }
 
